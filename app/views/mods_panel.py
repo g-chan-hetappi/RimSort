@@ -90,6 +90,7 @@ from app.utils.aux_db_utils import (
     auxdb_update_all_mod_colors,
     auxdb_update_mod_color,
 )
+from app.utils.color_utils import get_contrasting_text_color
 from app.utils.constants import (
     KNOWN_MOD_REPLACEMENTS,
 )
@@ -775,6 +776,18 @@ class ModListItemInner(QWidget):
             self._resize_text_after_icon_toggle(icon_count=new_icon_count)
             self._last_icon_count = new_icon_count
 
+    @staticmethod
+    def _background_style(background: QColor) -> str:
+        """
+        Build the stylesheet for a custom background color, with black or white
+        text chosen automatically so the mod name stays readable.
+
+        :param background: The custom background color.
+        :return: Stylesheet string.
+        """
+        text = get_contrasting_text_color(background).name()
+        return f"background: {background.name()}; color: {text};"
+
     def handle_mod_color_change(
         self, item: CustomListWidgetItem | None = None, init: bool = False
     ) -> None:
@@ -792,14 +805,14 @@ class ModListItemInner(QWidget):
             if init:
                 if self.mod_color:
                     new_mod_color_name = self.mod_color.name()
-                    self.setStyleSheet(f"background: {new_mod_color_name};")
+                    self.setStyleSheet(self._background_style(self.mod_color))
             elif item:
                 item_data = item.data(Qt.ItemDataRole.UserRole)
                 new_mod_color_name = item_data["mod_color"].name()
                 self.mod_color = item_data[
                     "mod_color"
                 ]  # Update mod color in ModListItemInner
-                self.setStyleSheet(f"background: {new_mod_color_name};")
+                self.setStyleSheet(self._background_style(item_data["mod_color"]))
         else:
             # Color text
             if init:

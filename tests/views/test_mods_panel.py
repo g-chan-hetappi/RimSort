@@ -583,6 +583,24 @@ def _make_item_inner(
     return widget
 
 
+@pytest.mark.parametrize(
+    ("background", "expected_text"),
+    [("#ffff00", "#000000"), ("#000080", "#ffffff")],
+)
+def test_background_color_picks_readable_text_color(
+    qtbot: Any, background: str, expected_text: str
+) -> None:
+    widget = _make_item_inner(qtbot, soft_warning=False)
+    widget.settings.color_background_instead_of_text_toggle = True
+    widget.mod_color = QColor(background)
+
+    widget.handle_mod_color_change(init=True)
+
+    style = widget.styleSheet()
+    assert f"background: {background};" in style
+    assert f"color: {expected_text};" in style
+
+
 def test_soft_warning_not_applied_when_load_order_warning_present(qtbot: Any) -> None:
     mod_a = _make_mod("Alpha", "/mods/a", "mod.a")
     mod_b = _make_mod("Beta", "/mods/b", "mod.b")
