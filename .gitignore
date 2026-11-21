@@ -63,3 +63,7 @@ ltex.dictionary*
 # direnv (.envrc.local holds personal overrides)
 /.direnv/
 /.envrc.local
+
+# other
+/prompt.txt
+/temp
