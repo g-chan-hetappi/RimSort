@@ -463,6 +463,10 @@ QLabel#browserPaneldownloader_label {
 QMainWindow {
     background-color: #101820;
 }
+/* Color picker dialog (mods_panel.py): match the main window background */
+QColorDialog {
+    background-color: #101820;
+}
 QWidget#MainPanel {
     border-style: solid;
     border-color: #3b4a64;
