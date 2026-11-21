@@ -1,0 +1,131 @@
+---
+title: Basic Usage
+nav_order: 2
+layout: default
+parent: User Guide
+permalink: user-guide/basic-usage
+---
+# Basic Usage
+
+{: .no_toc}
+
+## Table of Contents
+
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+## Initial Setup
+
+RimSort by default will prompt you to configure game configuration paths and install SteamCMD. It may also ask your preference for more critical settings such as whenever or not to enable Steam Integration. Outside of that, the default settings are applied, and you are free to configure as you like from the [Settings Panel](#settings-panel).
+
+## Main Menu Bar
+
+The main menu bar is, depending on your operating system and desktop environment, either the bar at the top of the main RimSort Window, or part of the global menu bar. It contains the RimSort version you are running as well as dropdown menus that hide additional options. Here, you'll find special options to interact with RimSort like opening, appending, saving, importing, and exporting your mod list, uploading logs, using the todds texture optimizer, or accessing the Steam Workshop.
+
+To merge a mod list with your current active list, use `File > Append Mod List...`. The mods from the selected file that are not already in your active list will be appended to it.
+
+## Player Log
+
+In the **Player Log** tab, scroll the left panel to reach the file controls, filters, and quick navigation when the window is short. The log view scrolls independently.
+
+## Settings panel
+
+You can enter the settings panel from the main menu bar using `File > Settings... ` In this window, you'll find multiple tabs, each labeled.
+
+### Minimum Required Settings
+
+At a minimum, the paths for the RimWorld install directory, RimWorld Config directory, and Local Mods need to be set. All other settings are optional for basic operations, but certain features may be inoperable.
+
+### RimWorld 1.7 Game and Content Locations
+
+RimWorld 1.7 uses new executable names: `RimWorld` on Linux, `RimWorld.exe` on Windows, and `RimWorld.app` on macOS. RimSort also recognizes the older executable names. If old and new executable files coexist in the selected Windows or Linux directory, the new name takes precedence; on Linux, a native executable takes precedence over a Windows executable used through Wine or Proton. Native Linux executables must have execute permission.
+
+On Windows and Linux, select the installation directory. On macOS, select the game’s `.app` bundle. Depending on the installation layout, `Data`, `Mods`, and `Version.txt` may be inside the bundle or beside it in the enclosing game directory. RimSort checks the selected location first, then the immediate parent of an existing `.app` bundle. It selects one content directory identified by `Data` and a version or Core metadata marker; it does not combine files from different locations or search arbitrary ancestors.
+
+Keep the selected bundle as **Game Location** and use the detected content directory’s `Mods` folder as **Local Mods**. There is no need to create a `Mods` symlink inside the bundle. If an existing workaround symlink points to the correct `Mods` directory, RimSort accepts it without changing the link. Cloning a split-layout installation copies the resolved game content directory, including the selected bundle, rather than copying only the bundle.
+
+On macOS, **Game location → Choose…** selects the `.app` bundle itself, including games installed on an external drive. You can also enter the full bundle path directly in the **Game location** field.
+
+If the executable is valid but the content directory cannot be identified, Settings accepts the game location with a diagnostic. An explicitly selected, existing local-mods directory is retained. Check the locations listed in the diagnostic: missing content prevents reliable version and official-module discovery. These discovery rules cover both macOS layouts; a different installation layout should be inspected rather than worked around by moving files.
+
+## Mod info panel
+
+The left side of the main window. Displays general information from a selected mod, with its preview image if found.
+
+While refreshing, the loading animation fits the available panel space and its progress text wraps to keep the window at its current size.
+
+Checking for RimSort or Workshop mod updates also shows a loading animation and status text while the request runs in the background. A slow or unavailable connection should leave the window responsive. Automatic database updates run in the background and report their activity in the status area.
+
+## Mod lists
+
+Certain errors/warnings are produced based on dependency presence, incompatibilities, load rules, and any potential updates found.
+
+### Saving and Launching with Incomplete Content Discovery
+
+Before saving, RimSort checks that Core was discovered as valid official content and that official DLC enabled in the existing `ModsConfig.xml` was also discovered. A matching package ID in a local or Workshop mod does not substitute for official content from the selected `Data` directory. An unreadable or malformed existing mod list also triggers a warning because its enabled DLC cannot be checked reliably.
+
+**Cancel** is the default. Cancel, Escape, or closing the warning leaves the file and saved/restore state unchanged. **Save anyway** explicitly writes the proposed active list; it does not reinsert Core or missing DLC. Intentionally disabling a DLC that was successfully discovered does not trigger this discovery warning. `knownExpansions` retains its existing behavior and is not an activation list.
+
+For a direct launch with a valid executable but unresolved content, RimSort offers a separate **Run anyway** confirmation, again with **Cancel** as the default. This does not repair content discovery or change the configured paths. Launching through the Steam protocol remains available when Steam Client Integration is enabled. If **Save and Run** is selected, a canceled or failed save stops the launch, including texture optimization and Steam app-ID file changes.
+
+## External Metadata
+
+{: .note}
+> RimSort releases do not come with this additional external metadata. For information on the optional but highly recommended databases that provide the additional external metadata and how to get them, see the [Databases page](../user-guide/databases).
+
+RimSort uses external metadata in order to enhance its functionality. The metadata provides it with additional information beyond the information present in a downloaded mod's `About.xml` file. External Metadata in RimSort is designed to be highly user extendable and sharable.
+
+In addition to the Steam Workshop and rules databases detailed below, RimSort supports other optional metadata databases, including the **Use This Instead** database (alternative mod suggestions for outdated or incompatible mods), the **No Version Warning** database (mods known to be version-agnostic), and the **RimWorld Versions** database (used by the Download RimWorld feature). See the [Databases page](../user-guide/databases) for details on configuring these.
+
+### Steam Workshop Metadata (`steamDB.json`)
+
+{: .d-inline-block}
+
+Steam Workshop Metadata
+{: .label .label-blue }
+
+  Contains metadata queried from Steam WebAPI + Steamworks API, utilizing the schema defined by Paladin's RimPy Mod Manager Database db.json
+
+  To build the Steam Workshop Database yourself, use the [SteamDB Builder](../user-guide/db-builder).
+  > Why is this necessary?
+  
+  - Dependency metadata that is available on Steam - mod developers list DLC dependencies as well as additional mod dependencies on Steam.
+    - In an ideal world, this can be taken care of completely by proper About.xml creation. However, SteamDB can supplement the available data if this is not done.
+  - Some local metadata is included from mods' About.xml. This includes PackageId and gameVersions.
+    - For legacy mods with an author and name but no PackageId, RimSort generates the same ID as RimWorld, using the author, name, and description. Successfully generated IDs are excluded from the missing PackageId warning. This does not edit the mod's About.xml or make an outdated mod compatible with newer game versions.
+    - Providing a complete database, this allows the user to be able to sometimes find mod dependencies even without having the mods already downloaded.
+      - When trying to import a mod list that contains mods that are not already available locally, in order to try to lookup PackageId -> PublishedFileId, SteamDB is necessary.
+
+### Rules Metadata (Community Rules Database, User Rules)
+
+{: .d-inline-block}
+
+Rules Metadata
+{: .label .label-red }
+
+  There are two external rules databases that RimSort uses, `userRules.json` and `communityRules.json`. They both provide the same functionality, but one is community driven and intended to be shared, and the other is intended for your own personal load order rules.
+  
+  Both of these databases uses a schema compatible with Paladin's RimPy Mod Manager Database communityRules.json.
+
+  {: .note}
+  > While you can modify the databases directly as they are plain text files, it is recommended to use RimSort's built in [Rule Editor](../user-guide/rule-editor) utility to edit the rules defined in these databases.
+
+  > Why is this necessary?
+
+  This also allows us to load in custom sorting rules! Mod developers are not always as responsive when conflicts or incompatibilities are found. This allows people to define additional sorting rules that are generally agreed upon by others as required. Traditionally, Paladin distributed these via RimPy Community Mod Manager Database. RimSort has chosen a different path of distribution, utilizing git.
+
+   - `loadAfter` and `loadBefore`
+      - These are rules native to RimWorld. These are typically defined in a mod's About.xml
+   - `loadBottom` - Originally defined by Paladin in RimPy Community Mod Manager Database community rules.
+      - Used to force mods to the bottom of a list when sorting. RimSort tags mods with this from external metadata when populated, allowing it to be considered as a "tier 3 mod" and sorting it _after_ any mods not tagged with this.
+    - `loadTop`
+      - Used to force mods to the top of a list when sorting. RimSort tags mods with this from external metadata when populated, allowing it to be considered as a "tier 1 mod" and sorting it _before_ any mods not tagged with this. This custom rule is original to RimSort.
+    - _**WIP**_ `isFramework`
+      - A "framework mod" is a mod which provides extension to other mods, but does not provide actual content when used by itself. This custom rule is original to RimSort.
+      - Examples of such mods:
+        - Universum, Vanilla Expanded Framework, XMLExtensions, etc
+      - RimSort will tag such mods that have this rule, so that it can display a warning when these mods are not being "depended on". There is not much point to using such mods without the mods that use them, it is a framework after all!
+
+  For detailed instructions on creating and managing these rules using the Rule Editor, including how to add custom load order rules for specific mods, see the [Rule Editor](../user-guide/rule-editor) page.

@@ -1,0 +1,150 @@
+import os
+import stat
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from app.utils.zip_extractor import create_zip_backup
+
+
+def _create_zip_with_entries(zip_path: str, entries: dict[str, str]) -> None:
+    """Create a ZIP file with the given filename->content entries."""
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for name, content in entries.items():
+            zf.writestr(name, content)
+
+
+class TestZipSlipProtection:
+    """Test that zip slip (path traversal) attacks are blocked."""
+
+    def test_legitimate_entries_extracted(self, tmp_path: Path) -> None:
+        """Normal zip entries should extract correctly."""
+        zip_path = str(tmp_path / "test.zip")
+        target = str(tmp_path / "output")
+        os.makedirs(target)
+
+        _create_zip_with_entries(
+            zip_path,
+            {
+                "mod/About.xml": "<xml>test</xml>",
+                "mod/Defs/thing.xml": "<Def>data</Def>",
+            },
+        )
+
+        from app.utils.zip_extractor import ZipExtractThread
+
+        thread = ZipExtractThread(zip_path, target)
+        thread.run()  # Run synchronously for testing
+
+        assert os.path.exists(os.path.join(target, "mod", "About.xml"))
+        assert os.path.exists(os.path.join(target, "mod", "Defs", "thing.xml"))
+
+    def test_traversal_entries_skipped(self, tmp_path: Path) -> None:
+        """Entries with ../ path traversal should be skipped."""
+        zip_path = str(tmp_path / "malicious.zip")
+        target = str(tmp_path / "output")
+        os.makedirs(target)
+
+        _create_zip_with_entries(
+            zip_path,
+            {
+                "safe/file.txt": "safe content",
+                "../../../etc/passwd": "malicious content",
+                "foo/../../escape.txt": "escaped content",
+            },
+        )
+
+        from app.utils.zip_extractor import ZipExtractThread
+
+        thread = ZipExtractThread(zip_path, target)
+        thread.run()
+
+        # Safe file should exist
+        assert os.path.exists(os.path.join(target, "safe", "file.txt"))
+        # Malicious files should NOT exist anywhere outside target
+        assert not os.path.exists(os.path.join(tmp_path, "etc", "passwd"))
+        assert not os.path.exists(os.path.join(tmp_path, "escape.txt"))
+
+    def test_absolute_path_entries_skipped(self, tmp_path: Path) -> None:
+        """Entries with absolute paths should be skipped."""
+        zip_path = str(tmp_path / "absolute.zip")
+        target = str(tmp_path / "output")
+        os.makedirs(target)
+
+        _create_zip_with_entries(
+            zip_path,
+            {
+                "normal.txt": "normal content",
+                "/tmp/evil.txt": "evil content",
+            },
+        )
+
+        from app.utils.zip_extractor import ZipExtractThread
+
+        thread = ZipExtractThread(zip_path, target)
+        thread.run()
+
+        assert os.path.exists(os.path.join(target, "normal.txt"))
+        # The /tmp/evil.txt should not be created at the absolute path
+        # (os.path.join with absolute second arg returns the absolute path,
+        # but realpath check should catch it)
+
+
+def test_failed_backup_preserves_existing_destination(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "RimSort").write_text("new application")
+    destination = tmp_path / "backup.zip"
+    with zipfile.ZipFile(destination, "w") as archive:
+        archive.writestr("RimSort", "last complete backup")
+
+    def fail_progress(_current: int, _total: int) -> None:
+        raise OSError("Backup interrupted")
+
+    with pytest.raises(OSError, match="Backup interrupted"):
+        create_zip_backup(source, destination, fail_progress)
+
+    with zipfile.ZipFile(destination) as archive:
+        assert archive.read("RimSort") == b"last complete backup"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["backup.zip", "source"]
+
+
+def test_unreadable_subdirectory_fails_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "backup.zip"
+
+    def fail_walk(*_args: object, **kwargs: object) -> list[object]:
+        onerror = kwargs.get("onerror")
+        if callable(onerror):
+            onerror(PermissionError("Unreadable subdirectory"))
+        return []
+
+    monkeypatch.setattr(os, "walk", fail_walk)
+    with pytest.raises(PermissionError, match="Unreadable subdirectory"):
+        create_zip_backup(source, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
+@pytest.mark.parametrize("mode", [0o755, 0o640])
+def test_backup_preserves_file_permissions(tmp_path: Path, mode: int) -> None:
+    source = tmp_path / "source"
+    file = source / "nested/RimSort"
+    file.parent.mkdir(parents=True)
+    payload = b"application payload" * 100
+    file.write_bytes(payload)
+    file.chmod(mode)
+    os.utime(file, (1, 1))
+    destination = tmp_path / "backup.zip"
+
+    create_zip_backup(source, destination)
+
+    with zipfile.ZipFile(destination) as archive:
+        info = archive.getinfo("nested/RimSort")
+        assert stat.S_IMODE(info.external_attr >> 16) == mode
+        assert info.compress_type == zipfile.ZIP_DEFLATED
+        assert archive.read(info) == payload

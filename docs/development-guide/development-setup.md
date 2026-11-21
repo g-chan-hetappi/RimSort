@@ -1,0 +1,261 @@
+---
+title: Development Setup & Building
+nav_order: 1
+layout: default
+parent: Development Guide
+permalink: development-guide/development-setup
+---
+# Development Setup & Building
+
+{: .no_toc }
+
+## Table of Contents
+
+{: .no_toc .text-delta }
+
+1. TOC
+{:toc}
+
+### Introduction
+
+RimSort is built in Python using the [PySide6](https://pypi.org/project/PySide6/) module, as well as several others. Some modules require special care in order to be built. It is compiled and packaged using [Nuitka](https://nuitka.net/).
+
+## Prerequisites
+
+### OS
+
+RimSort presently runs on Windows, MacOS, and Linux, though we presently only create builds for Ubuntu. It may work for other Linux distributions, but Ubuntu is our baseline.
+
+Your OS needs to be one that PySide6 supports. As an example, we use the following GitHub runners to make our release builds:
+
+- Linux:
+  - `ubuntu-22.04`
+  - `ubuntu-24.04`
+- macOS builds:
+  - `macos-latest` (arm)
+- Windows:
+  - `windows-latest`
+
+### Tools and Software
+
+**Required:**
+
+- [git](https://git-scm.com/)
+- [Python](https://python.org/) 3.14 (Can be installed with uv if you'd like)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- [just](https://just.systems/man/en/installation.html) — task runner for development commands
+
+**For code quality checks** (used by `just check` and CI):
+
+- [Node.js / npx](https://nodejs.org/) — needed for [JSCPD](https://github.com/kucherenko/jscpd) copy-paste detection (`just jscpd`)
+- [shfmt](https://github.com/mvdan/sh#shfmt) — shell script formatter (`just shfmt`)
+
+Python linters (ruff, mypy) are installed automatically by `uv sync` — no manual setup needed.
+
+### Cloning the repository
+
+RimSort uses submodules that are hosted in other repositories that need to be cloned.
+
+- [steamfiles](https://github.com/RimSort/steamfiles): used to parse Steam client acf/appinfo/manifest information
+- [SteamworksPy](https://github.com/philippj/SteamworksPy): used for interactions with the local Steam client
+  - SteamworksPy is a python module built to interface directly with the [Steamworks API](https://partner.steamgames.com/doc/api)
+  - This allows certain interactions with the local Steam client to be initiated through the Steamworks API via Python (such as subscribing/unsubscribing to/from Steam mods via RimSort)
+
+To clone with submodules run:
+
+```shell
+git clone --recurse-submodules -j8 https://github.com/RimSort/RimSort
+```
+
+Should you need to update these submodules, or you forgot to clone with `--recurse-submodules`, run:
+
+```shell
+git submodule update --init --recursive
+```
+
+## Set up your environment
+
+RimSort uses the Python package and project manager [uv](https://docs.astral.sh/uv/).
+
+The easiest way to set up everything (submodules, venv, dev + build dependencies) is:
+
+```shell
+just dev-setup
+```
+
+This runs `uv sync --locked --dev --group build`, which installs all runtime, dev, and build dependencies (including linters like ruff and mypy).
+
+After setup, install the shared git hooks so that `just check` runs automatically before each commit:
+
+```shell
+just install-hooks
+```
+
+If you prefer to do it manually:
+
+```shell
+uv sync --dev            # install runtime + dev dependencies (linters, test tools)
+uv sync --group build    # also install build dependencies (nuitka, etc.)
+```
+
+## Automated build process
+
+- For a (mostly automated) experience building RimSort, please execute the provided script:
+  - Run `uv run python distribute.py`
+    - This will build RimSort for your platform and output a build for your platform (Including all requirements and submodules)
+    - For additional options such as disabling certain steps, see `uv run python distribute.py --help`
+
+## Manually building
+
+Ensure that build requirements are installed by running `uv sync --group build`.
+
+### Setting up additional dependencies
+
+ RimSort uses Python, and depends on several Python modules. You can install/view most of the above dependencies via `pyproject.tom`. These would have been set up in the prior environment setup step. However, the **SteamworksPy** dependency is a special case that has requires special handling.
+
+See their respective sections for information on how to set them up. Alternatively, use `distribute.py` to do so automatically. By default, the script will build RimSort, but it can be configured to enable or disable various steps including building. See `uv run python distribute.py --help` for more info.
+
+- Mac users should also keep in mind that Apple has its own Runtime Protection called [Gatekeeper](https://support.apple.com/guide/security/gatekeeper-and-runtime-protection-sec5599b66df/web)
+  - This can cause issues when trying to run RimSort (or execute dependent libs)!
+  - You can circumvent this issue by using `xattr` command to manually whitelist:
+    - `xattr -d com.apple.quarantine /path/to/RimSort.app`
+    - `xattr -d com.apple.quarantine /path/to/libsteam_api.dylib`
+  - Replace `/path/to/` with the actual path where the file/folder is, example:
+    - `xattr -d com.apple.quarantine /Users/John/Downloads/RimSort.app`
+
+### Using SteamworksPy binaries
+
+For RimSort to actually USE the SteamworksPy module, you need the compiled library for your platform, as well as the binaries from the steamworks SDK in the RimSort project root - in conjunction with the Python module included in the submodule at: `submodules/SteamworksPy/library`.
+
+  - Repo maintainers will provide pre-built binaries for the `SteamworksPy` library, as well as the redistributables from the steamworks-sdk in-repo as well as in each platform's respective release.
+  - On Linux, you will want to copy `SteamworksPy_*.so` (where \* is your CPU) to `SteamworksPy.so`
+  - On macOS, you will want to copy `SteamworksPy_*.dylib` (where \* is your CPU) to `SteamworksPy.dylib`
+
+### Building SteamworksPy from source
+
+{: .note}
+> At the time of writing, the SteamworksPy module can only be built using Python 11, differing from RimSort itself. You may need to use a different Python environment from the one you use to handle RimSort.
+
+- You can set up this module using the following commands:
+
+  - `cd SteamworksPy`
+  - `pip install -r requirements.txt`
+
+This is an _**OPTIONAL**_ step. You do not _**NEED**_ to do this - there are already pre-built binaries available for usage in-repo as well as in each platform's respective release. Please do not attempt to commit/PR an update for these binaries without maintainer consent - these will not be approved otherwise.
+
+Reference: [SteamworksPy](https://philippj.github.io/SteamworksPy/)
+
+- On Linux, you need `g++`. It worked right out of the box for me on Ubuntu.
+- On macOS, you need Xcode command line tools. Then, you can compile directly with the script (without a full Xcode install):
+- On Windows, you need to get Visual Studio & Build Tools for Visual Studio:
+  - [MSVC](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
+    - When you run the downloaded executable, it updates and runs the Visual Studio Installer. To install only the tools you need for C++ development, select the "Desktop development with C++" workload. Alternatively, just install VS Community 2022 with the standard load set.
+
+Execute: `python -c "from distribute import build_steamworkspy; build_steamworkspy()"`
+
+### Texture optimization (todds)
+
+- RimSort uses [todds](https://github.com/todds-encoder/todds) as a dependency for texture optimization. It is shipped with RimSort, archived into the binary releases. If you are building/running from source, you will want to place a todds binary at `./todds/todds` (for Linux/Mac) OR `.\todds\todds.exe` (for Windows)
+
+### Running RimSort from source
+
+1. Clone this repository to a local directory with submodules.
+2. Ensure you have completed the prerequisite steps above.
+3. From the project root, execute `uv run python -m app`
+
+### Dev mode data isolation
+
+RimSort supports a **dev mode** that redirects all user data (settings, logs, databases, mod lists, themes, backups) to a `dev/` subdirectory of the repository root instead of your platform's standard application data directory. This prevents development runs from corrupting your production RimSort configuration.
+
+To activate dev mode, pass the `--dev` flag:
+
+```shell
+uv run python -m app --dev
+```
+
+**What changes in dev mode:**
+
+- Settings are stored at `dev/data/settings.json`
+- Logs are written to `dev/logs/`
+- Databases, mod lists, and backups live under `dev/data/`
+- Debug-level logging is enabled by default
+- The window title shows a `[DEV]` suffix
+
+**Environment variable overrides:**
+
+| Variable | Values | Effect |
+| :--- | :--- | :--- |
+| `RIMSORT_DEV` | `1`, `true` | Force dev mode on (equivalent to `--dev`) |
+| `RIMSORT_DEV` | `0`, `false` | Force dev mode off (overrides `--dev`) |
+| `RIMSORT_DEV_DIR` | absolute path | Override the dev data root (only when dev mode is active) |
+
+To use a custom dev data directory:
+
+```shell
+RIMSORT_DEV_DIR=/tmp/rimsort-test uv run python -m app --dev
+```
+
+Or via env vars only:
+
+```shell
+RIMSORT_DEV=1 RIMSORT_DEV_DIR=/tmp/rimsort-test uv run python -m app
+```
+
+The `dev/` directory is in `.gitignore` and will not be committed.
+
+### Packaging RimSort
+
+Packaging a distributable RimSort binary is fully automated by `distribute.py`, which
+initializes submodules, (optionally) builds the SteamworksPy library, fetches the latest
+`todds` release, and compiles the application with Nuitka. From the project root run:
+
+```shell
+uv run python distribute.py
+```
+
+For additional options (skipping steps, supplying a custom Steamworks SDK source,
+enabling dev mode, etc.), see:
+
+```shell
+uv run python distribute.py --help
+```
+
+If you need to drive Nuitka directly (for example, for local iteration), note that
+`freeze_application()` in `distribute.py` first adds the `SteamworksPy` submodule to
+`PYTHONPATH` and then compiles the `app/` package. Prefer the `distribute.py` script
+for real builds rather than invoking Nuitka by hand.
+
+### Native AppImage upgrade and recovery tests
+
+The Ubuntu 22.04 post-build job runs `tests/integration/test_appimage_upgrade.py`
+against the actual candidate AppImage under Xvfb and FUSE. It checks:
+
+- Pinned stable v1.17.4 upgrading to the candidate, including HTTP download,
+  installer handoff, replacement, normal candidate startup and clean shutdown.
+- The candidate's own updater performing another replacement. This uses the same
+  candidate bytes, bypassing release selection, to exercise the current updater.
+- A failed candidate startup retaining its previous AppImage. The test restores
+  that backup, undoes its injected fixture database corruption, and verifies a
+  normal launch and clean shutdown.
+- Preservation of fixture user files and backup cleanup after successful startup.
+
+The baseline download is checked against a pinned SHA256. A local HTTP server
+supplies the candidate. The installing GUI uses the existing helper entrypoint to
+configure disposable settings and accept the installation confirmation; replacement
+and recovered apps use their ordinary entrypoints. Process termination is restricted
+to the test GUI, and a relaunch barrier allows deterministic startup-failure injection.
+The actual download, staging, installer script, replacement and application startup
+are exercised. Release discovery and privileged installations are outside this test.
+
+On an x86_64 Linux host with FUSE, Xvfb, xdotool and the Qt system libraries installed:
+
+```shell
+RIMSORT_APPIMAGE_CANDIDATE=/absolute/path/RimSort.AppImage \
+  xvfb-run -a uv run --frozen --no-sync pytest --no-qt-log \
+  tests/integration/test_appimage_upgrade.py -s
+```
+
+Run as a regular user. Native cases skip when the candidate environment variable is
+absent or the host is not Linux; harness control tests remain part of the normal
+suite. All app profiles, mounts and test installations are temporary. These tests
+do not establish Windows MSI behavior or Linux elevation/cancellation behavior.

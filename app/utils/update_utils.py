@@ -1,0 +1,3031 @@
+from __future__ import annotations
+
+import ctypes
+import errno
+import os
+import platform
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import traceback
+from collections.abc import Callable
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from tempfile import gettempdir
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+from uuid import uuid4
+
+import requests
+from loguru import logger
+from PySide6.QtCore import (
+    QEventLoop,
+    QMetaObject,
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from app.utils import http
+from app.utils.app_info import AppInfo
+from app.utils.system_info import (
+    SystemInfo,
+    UnsupportedArchitectureError,
+    UnsupportedOperatingSystemError,
+)
+from app.utils.zip_extractor import (
+    BadZipFile,
+    ZipExtractThread,
+    create_zip_backup,
+    get_zip_contents,
+    validate_zip_integrity,
+)
+from app.views import dialogue
+from app.views.task_progress_window import TaskProgressWindow
+from packaging import version
+
+# Pre-compiled regex patterns for performance
+VERSION_PATTERN = re.compile(r"v?\d+[\.\-_]\d+")
+TAG_PREFIX_PATTERN = re.compile(r"^v", re.IGNORECASE)
+EDGE_VERSION_PATTERN = re.compile(
+    r"^(v?\d+\.\d+\.\d+)-edge(\d+)(?=\+|$)", re.IGNORECASE
+)
+
+# API and network constants
+GITHUB_API_URL = "https://api.github.com/repos/RimSort/RimSort/releases/latest"
+API_TIMEOUT = 15
+DOWNLOAD_TIMEOUT = 30
+
+# File and archive constants
+ZIP_EXTENSION = ".zip"
+TAR_GZ_EXTENSION = ".tar.gz"
+MSI_EXTENSION = ".msi"
+APPIMAGE_EXTENSION = ".AppImage"
+DOWNLOAD_CHUNK_SIZE = 131072  # 128KB for better performance
+MIN_UPDATE_SIZE = 1024  # Minimum reasonable size for an app update
+UPDATER_LOG_FILENAME = "updater.log"
+
+# Windows protected paths (application cannot write to these)
+WINDOWS_PROTECTED_PATHS = [
+    r"C:\PROGRAM FILES",
+    r"C:\PROGRAM FILES (X86)",
+    r"C:\WINDOWS",
+]
+
+# Tokens used for drive-agnostic protected path detection.
+# e.g. D:\Program Files (x86)\... or E:\Program Files (x86)\... should be treated as protected.
+WINDOWS_PROTECTED_TOKENS = [
+    "WINDOWS",
+    "PROGRAM FILES",
+    "PROGRAM FILES (X86)",
+]
+
+# Thread timeouts and waits
+BACKUP_TIMEOUT_SECONDS = 600  # 10 minutes for backup
+EXTRACTION_THREAD_TIMEOUT_MS = 5000  # 5 seconds for thread cleanup
+
+# Platform-specific constants
+# Note: TEMP_DIR_DARWIN and TEMP_DIR_DEFAULT are unused and can be removed
+
+# No Version Dialog Constants
+UNKNOWN_VERSION_TITLE = "Unknown Version Detected"
+
+# Standardized error messages
+ERR_UPDATE_SKIPPED_TITLE = "Update skipped"
+ERR_UPDATE_SKIPPED_TEXT = "You are running from Python interpreter."
+ERR_UPDATE_SKIPPED_INFO = "Skipping update check..."
+ERR_UPDATE_ERROR_TITLE = "RimSort Update Error"
+ERR_NO_VALID_RELEASE_TITLE = "RimSort Update Error"
+ERR_NO_VALID_RELEASE_TEXT = "Failed to find valid RimSort release for {system_info}"
+ERR_API_CONNECTION_TITLE = "RimSort Update Error"
+ERR_API_CONNECTION_TEXT = "Failed to connect to GitHub API: {error}"
+ERR_DOWNLOAD_FAILED_TITLE = "Download failed"
+ERR_DOWNLOAD_FAILED_TEXT = "Failed to download the update."
+ERR_EXTRACTION_FAILED_TITLE = "Extraction failed"
+ERR_EXTRACTION_FAILED_TEXT = "Failed to extract the downloaded update."
+ERR_BACKUP_FAILED_TITLE = "Backup failed"
+ERR_BACKUP_FAILED_TEXT = "Failed to create a backup before updating."
+ERR_LAUNCH_FAILED_TITLE = "Launch failed"
+ERR_LAUNCH_FAILED_TEXT = "Failed to launch the update script."
+ERR_UPDATE_FAILED_TITLE = "Update failed"
+ERR_UPDATE_FAILED_TEXT = "An unexpected error occurred during the update process."
+ERR_RETRIEVE_RELEASE_TITLE = "Unable to retrieve latest release information"
+ERR_RETRIEVE_RELEASE_TEXT = "Please check your internet connection and try again, You can also check 'https://github.com/RimSort/RimSort/releases' directly."
+
+if TYPE_CHECKING:
+    from app.models.settings import Settings
+
+
+class UpdateError(Exception):
+    """Base exception for update-related errors."""
+
+
+class UpdateNetworkError(UpdateError):
+    """Raised when network-related errors occur."""
+
+
+class UpdateDownloadError(UpdateError):
+    """Raised when download fails."""
+
+
+class UpdateExtractionError(UpdateError):
+    """Raised when extraction fails."""
+
+
+class _NormalizationCancelled(UpdateError):
+    """Stop an update when the application quits during normalization."""
+
+
+class UpdateScriptLaunchError(UpdateError):
+    """Raised when launching update script fails."""
+
+
+def _create_macos_bundle_backup(
+    source: Path,
+    destination: Path,
+    progress_callback: Callable[[int, int], None] | None,
+) -> None:
+    if not source.is_dir():
+        raise OSError(f"Source directory does not exist: {source}")
+    if destination.resolve().is_relative_to(source.resolve()):
+        raise OSError("Application backup must be outside the application bundle")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".partial.tar.gz", dir=destination.parent
+    )
+    os.close(fd)
+    temporary_path = Path(name)
+    command = [
+        "/usr/bin/tar",
+        "--mac-metadata",
+        "--acls",
+        "--xattrs",
+        "-czf",
+        str(temporary_path),
+        "-C",
+        str(source.parent),
+        "--",
+        f"./{source.name}",
+    ]
+    archive_env = dict(os.environ)
+    archive_env.pop("DITTONORSRC", None)
+    archive_env.pop("COPYFILE_DISABLE", None)
+    try:
+        if progress_callback:
+            progress_callback(0, 1)
+        with subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=archive_env,
+        ) as process:
+            try:
+                while True:
+                    try:
+                        _, error = process.communicate(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if progress_callback:
+                            progress_callback(0, 1)
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+            if process.returncode != 0:
+                detail = error.decode("utf-8", errors="replace").strip()
+                raise OSError(f"macOS bundle backup failed: {detail}")
+        if temporary_path.stat().st_size == 0:
+            raise OSError("macOS bundle backup is empty")
+        if progress_callback:
+            progress_callback(1, 1)
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _create_application_backup(
+    source: Path,
+    destination: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> None:
+    """Back up the running installation, including the outer macOS bundle."""
+    if sys.platform == "darwin" and "__compiled__" in globals():
+        bundle = source.parent.parent
+        if (
+            source.name != "MacOS"
+            or source.parent.name != "Contents"
+            or bundle.suffix.lower() != ".app"
+            or not (bundle / "Contents" / "Info.plist").is_file()
+            or not (source / "RimSort").is_file()
+        ):
+            raise OSError(f"Cannot locate complete macOS application bundle: {source}")
+        _create_macos_bundle_backup(bundle, destination, progress_callback)
+    else:
+        create_zip_backup(source, destination, progress_callback)
+
+
+class _BackupWorker(QThread):
+    progress = Signal(int, int)
+
+    def __init__(self, source: Path, destination: Path) -> None:
+        super().__init__()
+        self.source = source
+        self.destination = destination
+        self.error: str | None = None
+
+    def run(self) -> None:
+        def report_progress(current: int, total: int) -> None:
+            if self.isInterruptionRequested():
+                raise InterruptedError("Backup cancelled")
+            self.progress.emit(current, total)
+
+        try:
+            if self.isInterruptionRequested():
+                raise InterruptedError("Backup cancelled")
+            _create_application_backup(self.source, self.destination, report_progress)
+        except Exception as error:
+            self.error = str(error)
+            logger.exception("Application backup failed")
+
+
+class ReleaseInfo(TypedDict):
+    """Type definition for release information dictionary."""
+
+    version: version.Version
+    tag_name: str
+    download_url: str
+    is_msi: bool
+    is_appimage: bool
+    is_tar_gz: bool
+
+
+class DownloadInfo(TypedDict):
+    """Type definition for download information dictionary."""
+
+    url: str
+    name: str
+    is_msi: bool
+    is_appimage: bool
+    is_tar_gz: bool
+
+
+class PlatformPatterns(TypedDict):
+    """Type definition for platform pattern configuration."""
+
+    patterns: list[str]
+    arch_patterns: dict[str, list[str]]
+
+
+class ScriptConfig:
+    """Configuration for platform-specific update scripts."""
+
+    def __init__(
+        self,
+        script_name: str,
+        start_new_session: bool | None,
+        platform: str,
+    ) -> None:
+        self.script_name = script_name
+        self.start_new_session = start_new_session
+        self.platform = platform
+
+    def get_script_path(self) -> Path:
+        """Get the script path for this platform."""
+        if self.platform == "Darwin":
+            return (
+                Path(sys.argv[0]).parent.parent.parent
+                / "Contents"
+                / "MacOS"
+                / self.script_name
+            )
+        else:
+            return AppInfo().application_folder / self.script_name
+
+    def get_args(
+        self,
+        script_path: Path,
+        temp_path: Path,
+        log_path: Path,
+        needs_elevation: bool = False,
+        install_dir: Path | None = None,
+        update_manager: UpdateManager | None = None,
+    ) -> str | list[str]:
+        """
+        Get the appropriate arguments for launching the update script based on platform and elevation needs.
+
+        Args:
+            script_path: Path to the update script
+            temp_path: Path to the temporary extraction directory
+            log_path: Path to the update log file
+            needs_elevation: Whether elevated privileges are required
+            install_dir: Installation directory (required for Linux and macOS)
+            update_manager: UpdateManager instance (for backwards compatibility, not used)
+
+        Returns:
+            Arguments string or list for subprocess
+        """
+        base_args = [str(script_path), str(temp_path), str(log_path)]
+        if self.platform == "Windows":
+            base_args.append(str(AppInfo().application_folder))
+        elif install_dir and self.platform in {"Linux", "Darwin"}:
+            base_args.append(str(install_dir))
+
+        return self._build_platform_args(
+            base_args, script_path, needs_elevation, update_manager
+        )
+
+    @staticmethod
+    def _build_bash_command(base_args: list[str], needs_elevation: bool) -> str:
+        """
+        Build a bash command string for launching update script directly.
+        Used as primary method for modern terminal emulators and standalone execution.
+
+        Args:
+            base_args: Base arguments list [script_path, temp_path, log_path, install_dir?]
+            needs_elevation: Whether to use sudo
+
+        Returns:
+            Command string for executing the update script
+        """
+        quoted_args = " ".join(shlex.quote(arg) for arg in base_args)
+        if needs_elevation:
+            return f"sudo {quoted_args}"
+        else:
+            return quoted_args
+
+    @staticmethod
+    def _build_terminal_command(
+        terminal: str, base_args: list[str], needs_elevation: bool
+    ) -> str:
+        """
+        Build terminal-specific command string for launching update script.
+        Used as fallback if direct bash execution is not available.
+
+        Args:
+            terminal: Name of the terminal emulator (e.g., "gnome-terminal", "kitty")
+            base_args: Base arguments list [script_path, temp_path, log_path, install_dir?]
+            needs_elevation: Whether to use sudo
+
+        Returns:
+            Command string for the terminal emulator
+
+        Raises:
+            ValueError: If terminal emulator is unknown
+        """
+        quoted_args = " ".join(shlex.quote(arg) for arg in base_args)
+        cmd_with_pause = f'{quoted_args}; read -p \\"Press enter to close\\"'
+
+        # gnome-terminal uses -- instead of -e
+        if terminal == "gnome-terminal":
+            if needs_elevation:
+                return f'gnome-terminal -- bash -c "sudo {quoted_args}"'
+            else:
+                return f'gnome-terminal -- bash -c "{cmd_with_pause}"'
+
+        # konsole, xterm, x-terminal-emulator, and kitty use -e or equivalent
+        elif terminal in ["konsole", "xterm", "x-terminal-emulator", "kitty"]:
+            if needs_elevation:
+                return f'{terminal} -e bash -c "sudo {quoted_args}"'
+            else:
+                return f'{terminal} -e bash -c "{cmd_with_pause}"'
+
+        # xfce4-terminal and mate-terminal need nested quoting
+        elif terminal in ["xfce4-terminal", "mate-terminal"]:
+            if needs_elevation:
+                return f"{terminal} -e \"bash -c 'sudo {quoted_args}'\""
+            else:
+                return f"{terminal} -e \"bash -c '{cmd_with_pause}'\""
+
+        else:
+            raise ValueError(f"Unknown terminal emulator: {terminal}")
+
+    def _build_platform_args(
+        self,
+        base_args: list[str],
+        script_path: Path,
+        needs_elevation: bool,
+        update_manager: UpdateManager | None = None,
+    ) -> str | list[str]:
+        """
+        Build platform-specific arguments for launching the update script.
+
+        For Linux: Uses a two-phase approach:
+        1. Primary: Direct bash execution (works with all modern terminal emulators)
+        2. Fallback: Terminal emulator detection if primary method fails
+
+        Args:
+            base_args: Base arguments list [script_path, temp_path, log_path, install_dir?]
+            script_path: Path to the update script
+            needs_elevation: Whether elevated privileges are required
+            update_manager: UpdateManager instance (required for Linux fallback detection)
+
+        Returns:
+            Arguments string or list for subprocess
+
+        Raises:
+            ValueError: If platform is unsupported
+        """
+        if self.platform == "Darwin":
+            quoted_args = " ".join(shlex.quote(arg) for arg in base_args)
+            terminal_cmd = f'/bin/bash {quoted_args}; read -p "Press enter to close"'
+            script_cmd = f"sudo {terminal_cmd}" if needs_elevation else terminal_cmd
+            script_cmd = script_cmd.replace("\\", "\\\\").replace('"', '\\"')
+            applescript = f'tell app "Terminal" to do script "{script_cmd}"'
+            return f"osascript -e {shlex.quote(applescript)}"
+        elif self.platform == "Windows":
+            if needs_elevation:
+                # Properly escape paths for PowerShell with special characters and spaces
+                # Paths need to be quoted for cmd.exe which is the actual executor
+                script_dir = str(script_path.parent)
+                script_file = str(script_path)
+                temp_path = str(base_args[1])
+                log_path = str(base_args[2])
+
+                # Build the cmd command with properly quoted arguments
+                # Using double quotes for cmd.exe path arguments
+                cmd_command = f'cd /d "{script_dir}" && "{script_file}" "{temp_path}" "{log_path}"'
+
+                # Escape single quotes in cmd_command for PowerShell (double them)
+                cmd_command_escaped = cmd_command.replace("'", "''")
+
+                return (
+                    f"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process cmd -ArgumentList @('/k', "
+                    f"'{cmd_command_escaped}') "
+                    f'-Verb RunAs -WindowStyle Normal"'
+                )
+            else:
+                # Return as list - subprocess will handle proper quoting
+                return [
+                    "cmd",
+                    "/k",
+                    str(script_path),
+                    str(base_args[1]),
+                    str(base_args[2]),
+                ]
+        elif self.platform == "Linux":
+            # Linux: Try direct bash execution first (primary method)
+            cmd = self._build_bash_command(base_args, needs_elevation)
+            logger.debug("Linux: Using direct bash command (primary method)")
+            return cmd
+        else:
+            raise ValueError(f"Unsupported platform: {self.platform}")
+
+
+class TarExtractThread(QThread):
+    """Extract tar.gz files in a separate thread with progress reporting.
+
+    Mirrors :class:`ZipExtractThread` so the update manager can drive both
+    archive types through the same QEventLoop pattern.
+    """
+
+    progress = Signal(int, str)
+    finished = Signal(bool, str)
+
+    def __init__(self, tar_path: str, target_path: str) -> None:
+        super().__init__()
+        self.tar_path = tar_path
+        self.target_path = target_path
+        self._should_abort = False
+
+    def run(self) -> None:
+        start = time.perf_counter()
+        try:
+            with tarfile.open(self.tar_path, "r:gz") as tf:
+                members = tf.getmembers()
+                total = len(members)
+
+                if total == 0:
+                    self.finished.emit(False, "tar.gz archive is empty")
+                    return
+
+                update_interval = max(1, total // 100)
+                sidecars: set[Path] = set()
+
+                def extraction_filter(
+                    member: tarfile.TarInfo, destination: str
+                ) -> tarfile.TarInfo | None:
+                    filtered = tarfile.data_filter(member, destination)
+                    if (
+                        sys.platform == "darwin"
+                        and filtered is not None
+                        and Path(filtered.name).name.startswith("._")
+                    ):
+                        sidecars.add(Path(destination) / filtered.name)
+                    return filtered
+
+                for i, member in enumerate(members):
+                    if self._should_abort:
+                        self.finished.emit(False, "Operation aborted")
+                        return
+
+                    tf.extract(member, self.target_path, filter=extraction_filter)
+
+                    if i % update_interval == 0 or i == total - 1:
+                        percent = int((i + 1) / total * 100)
+                        self.progress.emit(
+                            percent, f"Extracting: {i + 1} / {total} files"
+                        )
+
+            if sys.platform == "darwin":
+                self._restore_macos_metadata(sidecars)
+            if self._should_abort:
+                raise InterruptedError("Operation aborted")
+
+            elapsed = time.perf_counter() - start
+            self.finished.emit(
+                True,
+                f"{self.tar_path} → {self.target_path}\n"
+                f"Time elapsed: {elapsed:.2f} seconds",
+            )
+
+        except InterruptedError:
+            self.finished.emit(False, "Operation aborted")
+        except Exception as e:
+            logger.exception("tar.gz extraction failed")
+            self.finished.emit(False, f"Extraction error: {e!s}")
+
+    def _restore_macos_metadata(self, sidecars: set[Path]) -> None:
+        """Unpack AppleDouble metadata after safely extracting archive members."""
+        if not sidecars:
+            return
+        root = Path(self.target_path).resolve()
+        native = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        copyfile = native.copyfile
+        copyfile.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        copyfile.restype = ctypes.c_int
+        native.copyfile_state_alloc.argtypes = []
+        native.copyfile_state_alloc.restype = ctypes.c_void_p
+        native.copyfile_state_set.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        native.copyfile_state_set.restype = ctypes.c_int
+        native.copyfile_state_free.argtypes = [ctypes.c_void_p]
+        native.copyfile_state_free.restype = ctypes.c_int
+        callback_type = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            use_errno=True,
+        )
+        native_error = 0
+
+        def on_status(
+            _what: int,
+            stage: int,
+            _state: int | None,
+            _source: bytes | None,
+            _destination: bytes | None,
+            _context: int | None,
+        ) -> int:
+            nonlocal native_error
+            # COPYFILE_ERR must be recorded: later ACL work can clear the result.
+            if stage == 3:
+                native_error = ctypes.get_errno() or errno.EIO
+                return 2  # COPYFILE_QUIT
+            return 2 if self._should_abort else 0  # COPYFILE_QUIT / COPYFILE_CONTINUE
+
+        callback = callback_type(on_status)
+        # copyfile.h: COPYFILE_UNPACK | COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST.
+        flags = (1 << 23) | (1 << 18) | (1 << 19)
+        paths = {path.parent.resolve() / path.name for path in sidecars}
+        for sidecar in sorted(paths, key=lambda path: len(path.parts), reverse=True):
+            if self._should_abort:
+                raise InterruptedError("Operation aborted")
+            if not sidecar.is_relative_to(root):
+                raise UpdateExtractionError(f"Metadata outside staging: {sidecar}")
+            if not stat.S_ISREG(sidecar.lstat().st_mode):
+                continue
+            with sidecar.open("rb") as stream:
+                if stream.read(8) != b"\x00\x05\x16\x07\x00\x02\x00\x00":
+                    continue
+            destination = sidecar.with_name(sidecar.name[2:])
+            if not destination.resolve().is_relative_to(root):
+                raise UpdateExtractionError(
+                    f"Metadata target outside staging: {destination}"
+                )
+            if not destination.exists() and not destination.is_symlink():
+                raise UpdateExtractionError(f"Missing metadata target: {destination}")
+            state = native.copyfile_state_alloc()
+            if not state:
+                raise MemoryError("Failed to allocate macOS metadata state")
+            try:
+                # COPYFILE_STATE_STATUS_CB is 6 in copyfile.h.
+                if native.copyfile_state_set(state, 6, callback) != 0:
+                    error = ctypes.get_errno() or errno.EIO
+                    raise OSError(error, os.strerror(error), str(sidecar))
+                native_error = 0
+                result = copyfile(
+                    os.fsencode(sidecar), os.fsencode(destination), state, flags
+                )
+                if self._should_abort:
+                    raise InterruptedError("Operation aborted")
+                if result != 0 or native_error:
+                    error = native_error or ctypes.get_errno() or errno.EIO
+                    raise OSError(error, os.strerror(error), str(sidecar))
+            finally:
+                native.copyfile_state_free(state)
+            sidecar.unlink()
+
+    def stop(self) -> None:
+        """Signal the thread to abort extraction on next iteration."""
+        self._should_abort = True
+
+
+# GitHub signals both its primary limit and its secondary (abuse) limit with a
+# 403, and 429 for the softer primary case. Only treat a 403 as a rate limit
+# when the body confirms it, so unrelated 403s keep the generic message.
+_RATE_LIMIT_MARKERS = ("rate limit", "abuse detection")
+
+
+def is_github_rate_limit_error(error: requests.RequestException) -> bool:
+    """Check whether a GitHub API failure was caused by rate limiting.
+
+    :param error: Exception raised by ``response.raise_for_status()``.
+    :return: True when GitHub refused the request because of a rate limit.
+    """
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+
+    body = str(getattr(response, "text", "") or "").lower()
+    haystack = f"{body} {error!s}".lower()
+    return any(marker in haystack for marker in _RATE_LIMIT_MARKERS)
+
+
+def rate_limit_reset_clock(response: Any) -> str:
+    """Read GitHub's next-allowed-request time from a failed response.
+
+    :param response: The failed response, or None.
+    :return: Clock time as ``HH:MM``, or an empty string when unavailable.
+    """
+    if response is None:
+        return ""
+
+    headers = getattr(response, "headers", None)
+    reset = headers.get("X-RateLimit-Reset") if headers else None
+    if not reset:
+        return ""
+
+    try:
+        return datetime.fromtimestamp(int(reset)).strftime("%H:%M")  # noqa: DTZ006
+    except TypeError, ValueError:
+        return ""
+
+
+class UpdateManager(QObject):
+    update_progress = Signal(int, str)  # percent, message
+    download_complete = Signal(bool, str)  # success, error_message
+    update_available = Signal(str)
+
+    _architecture_patterns = {  # noqa: RUF012
+        "x64": ["x86_64", "amd64", "x64"],
+        "x86": ["x86", "i386", "i686"],
+        "arm64": ["arm64", "aarch64"],
+    }
+
+    # Class-level cached platform patterns for performance
+    _platform_patterns = {  # noqa: RUF012
+        "Darwin": {
+            "patterns": ["Darwin", "macOS", "Mac"],
+            "arch_patterns": _architecture_patterns,
+        },
+        "Linux": {
+            "patterns": ["Linux", "Ubuntu"],
+            "arch_patterns": _architecture_patterns,
+        },
+        "Windows": {
+            "patterns": ["Windows", "Win"],
+            "arch_patterns": _architecture_patterns,
+        },
+    }
+
+    # Platform-specific script configurations
+    _script_configs: dict[str, ScriptConfig] = {  # noqa: RUF012
+        "Darwin": ScriptConfig(
+            script_name="update.sh",
+            start_new_session=False,
+            platform="Darwin",
+        ),
+        "Windows": ScriptConfig(
+            script_name="update.bat",
+            start_new_session=None,  # Not used on Windows
+            platform="Windows",
+        ),
+        "Linux": ScriptConfig(
+            script_name="update.sh",
+            start_new_session=True,
+            platform="Linux",
+        ),
+    }
+
+    def __init__(
+        self,
+        settings: Settings,
+        main_content: Any,
+        mod_info_panel: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.settings = settings
+        self.main_content = main_content
+        self.mod_info_panel = mod_info_panel
+        self._update_content: bytes | None = None
+        self._extracted_path: Path | None = None
+        self._elevation_needed: bool | None = None  # Cache elevation check result
+        # Cache platform info to avoid repeated calls
+        self._system = platform.system()
+        try:
+            architecture = SystemInfo().architecture
+            self._arch = architecture.name.lower() if architecture is not None else ""
+        except (UnsupportedArchitectureError, UnsupportedOperatingSystemError) as error:
+            logger.warning(f"Cannot select an application update: {error}")
+            self._arch = ""
+        # Cache platform patterns for performance
+        self._cached_patterns = self._platform_patterns.get(self._system, None)
+        self._download_cancelled = False
+        self._detected_terminal: str | None = (
+            None  # Cache detected terminal emulator (for fallback only)
+        )
+        # Progress window for update operations
+        self._progress_widget: TaskProgressWindow | None = None
+        self._quiet_check_thread: threading.Thread | None = None
+
+    def _check_needs_elevation(self) -> bool:
+        """
+        Check if elevation is needed for the update process.
+        Caches the result to avoid redundant system calls.
+
+        On Linux AppImages the application folder is a read-only FUSE mount,
+        so the directory containing the .AppImage file is checked instead.
+
+        Returns:
+            bool: True if elevation is needed, False otherwise
+        """
+        if self._elevation_needed is not None:
+            return self._elevation_needed
+
+        if self._system == "Windows":
+            if self._is_in_protected_path():
+                self._elevation_needed = True
+                return True
+
+            # Test write access
+            if self._test_write_access():
+                self._elevation_needed = False
+                return False
+            else:
+                self._elevation_needed = True
+                return True
+        else:
+            # An AppImage's application_folder is the read-only FUSE mount; the
+            # update replaces the .AppImage file in its own directory instead.
+            appimage_path = AppInfo().appimage_path
+            install_folder = (
+                appimage_path.parent
+                if appimage_path is not None
+                else AppInfo().application_folder
+            )
+            if appimage_path is not None:
+                replacement_parent = install_folder
+            elif self._system == "Darwin":
+                replacement_parent = install_folder.parents[2]
+            else:
+                replacement_parent = install_folder.parent
+            self._elevation_needed = not (
+                os.access(install_folder, os.W_OK)
+                and os.access(replacement_parent, os.W_OK)
+            )
+            return self._elevation_needed
+
+    def _is_in_protected_path(self) -> bool:
+        """Check if application is installed in Windows protected path."""
+        app_folder = AppInfo().application_folder
+        app_path_str = str(app_folder).replace("/", "\\").upper()
+
+        # Primary check: legacy protected strings (typically C:\...).
+        for protected in WINDOWS_PROTECTED_PATHS:
+            if protected in app_path_str:
+                logger.info(
+                    f"Application in protected path: {protected} - elevation required"
+                )
+                return True
+
+        # Secondary check: drive-agnostic token match.
+        # Detect protected directory segments without relying on drive letter.
+        # We only match full directory names (e.g. \PROGRAM FILES\), not partial substrings.
+        for token in WINDOWS_PROTECTED_TOKENS:
+            protected_dir_pattern = f"\\{token}\\"
+            if protected_dir_pattern in app_path_str:
+                logger.info(
+                    f"Application in protected path token '{token}' - elevation required"
+                )
+                return True
+
+        return False
+
+    def _test_write_access(self) -> bool:
+        """Test if write access is available in application folder."""
+        app_folder = AppInfo().application_folder
+        try:
+            test_file = app_folder / "test_write.tmp"
+            test_file.write_text("test")
+            test_file.unlink()
+            logger.debug("Write test passed; no elevation needed")
+            return True
+        except (OSError, PermissionError) as write_err:
+            logger.info(f"Write access test failed ({write_err}); elevation required")
+            return False
+
+    def _detect_terminal_emulator(self) -> str:
+        """
+        Detect available terminal emulator on Linux systems.
+        Caches the result to avoid redundant filesystem checks.
+        Used as fallback if direct bash execution fails.
+
+        Returns:
+            str: Name of the detected terminal emulator
+
+        Raises:
+            UpdateScriptLaunchError: If no terminal emulator is found
+        """
+        if self._detected_terminal is not None:
+            return self._detected_terminal
+
+        # Priority order: modern terminals first, then legacy options
+        terminal_candidates = [
+            "kitty",  # Modern GPU-accelerated terminal
+            "gnome-terminal",
+            "konsole",
+            "xfce4-terminal",
+            "mate-terminal",
+            "xterm",
+            "x-terminal-emulator",  # Debian/Ubuntu backward compatibility
+        ]
+
+        for terminal in terminal_candidates:
+            if shutil.which(terminal) is not None:
+                logger.debug(f"Detected terminal emulator for fallback: {terminal}")
+                self._detected_terminal = terminal
+                return terminal
+
+        # No terminal found - provide helpful error
+        raise UpdateScriptLaunchError(
+            "No terminal emulator found on system. Tried: "
+            "kitty, gnome-terminal, konsole, xfce4-terminal, mate-terminal, xterm, x-terminal-emulator. "
+            "Please install one of these or ensure the update script is executable."
+        )
+
+    def _check_for_update_silently(self) -> None:
+        """Look for a release in the background without interrupting the user."""
+        if os.getenv("RIMSORT_DISABLE_UPDATER") or "__compiled__" not in globals():
+            return
+        if self._quiet_check_thread is not None and self._quiet_check_thread.is_alive():
+            return
+        self._quiet_check_thread = threading.Thread(
+            target=self._quiet_check_worker, daemon=True
+        )
+        try:
+            self._quiet_check_thread.start()
+        except Exception as e:
+            self._quiet_check_thread = None
+            logger.warning(f"Unable to start background update check: {e}")
+
+    def _quiet_check_worker(self) -> None:
+        try:
+            current_version = self._parse_current_version(AppInfo().app_version)
+            if current_version is None:
+                return
+            release = self._get_latest_release_info(quiet=True)
+            if release is not None:
+                tag = (
+                    release["tag_name"] if release["version"] > current_version else ""
+                )
+                self.update_available.emit(tag)
+        except Exception as e:
+            logger.warning(f"Background update check failed: {e}")
+
+    def do_check_for_update(self) -> None:
+        """
+        Check for RimSort updates and handle the update process.
+
+        This method orchestrates the update process by delegating to focused sub-methods
+        for better maintainability and testability.
+        """
+        start_time = datetime.now()  # noqa: DTZ005
+        logger.info("Starting update check process...")
+
+        try:
+            # Validate prerequisites
+            if not self._validate_prerequisites():
+                return
+
+            # Fetch and compare versions
+            update_info = self._fetch_and_compare_versions()
+            if not update_info:
+                logger.info("No update available or update declined by user")
+                return
+
+            # Handle the update process
+            self._handle_update_process(update_info)
+
+            total_time = (datetime.now() - start_time).total_seconds()  # noqa: DTZ005
+            logger.info(f"Update check process completed in {total_time:.2f}s")
+
+        except Exception as e:
+            total_time = (datetime.now() - start_time).total_seconds()  # noqa: DTZ005
+            logger.exception(f"Update check failed after {total_time:.2f}s")
+            dialogue.show_warning(
+                title=self.tr(ERR_UPDATE_FAILED_TITLE),
+                text=self.tr(ERR_UPDATE_FAILED_TEXT),
+                information=f"Unexpected error during update check: {e!s}",
+                details=traceback.format_exc(),
+            )
+
+    def _validate_prerequisites(self) -> bool:
+        """
+        Validate all prerequisites for the update process.
+
+        Returns:
+            bool: True if all prerequisites are met, False otherwise
+        """
+        # Check for disable flag
+        if os.getenv("RIMSORT_DISABLE_UPDATER"):
+            logger.debug(
+                "RIMSORT_DISABLE_UPDATER is set, skipping update check silently."
+            )
+            return False
+
+        # Check if running from compiled binary built by Nuitka or running from Python interpreter
+        if "__compiled__" not in globals():
+            logger.debug(
+                "You are running from Python interpreter. Skipping update check..."
+            )
+            dialogue.show_warning(
+                title=ERR_UPDATE_SKIPPED_TITLE,
+                text=ERR_UPDATE_SKIPPED_TEXT,
+                information=ERR_UPDATE_SKIPPED_INFO,
+            )
+            return False
+
+        return True
+
+    def _fetch_and_compare_versions(self) -> dict[str, Any] | None:
+        """
+        Fetch latest release information and compare versions.
+
+        Returns:
+            Dict containing update information if update is available and accepted,
+            None if no update needed or update declined
+        """
+        # Determine if elevation is needed
+        needs_elevation = self._check_needs_elevation()
+        if self._system != "Windows" and needs_elevation:
+            needs_elevation = False
+
+        current_version = AppInfo().app_version
+        logger.info(f"Current RimSort version: {current_version}")
+        current_version_parsed = self._parse_current_version(current_version)
+        if current_version_parsed is None:
+            dialogue.show_warning(
+                title=self.tr(UNKNOWN_VERSION_TITLE),
+                text=self.tr(
+                    "RimSort could not read its current version, so it cannot "
+                    "safely check for updates."
+                ),
+                information=self.tr(
+                    "Download a stable release manually from "
+                    '<a href="https://github.com/RimSort/RimSort/releases/latest">'
+                    "the RimSort releases page</a>."
+                ),
+            )
+            return None
+
+        # Get the latest release info
+        logger.info("Fetching latest release information from GitHub API...")
+        latest_release_info = self._get_latest_release_info(needs_elevation)
+        if not latest_release_info:
+            logger.warning("Failed to retrieve latest release information")
+            return None
+
+        latest_version = latest_release_info["version"]
+        latest_tag_name = latest_release_info["tag_name"]
+        download_url = latest_release_info["download_url"]
+
+        logger.info(f"Latest RimSort version: {latest_version}")
+        logger.info(f"Update available: {latest_tag_name} ({latest_version})")
+
+        # Compare versions
+        if current_version_parsed >= latest_version:
+            logger.info("Already running the latest version")
+            return None
+
+        # Prompt user for update
+        if not self._prompt_user_for_update(latest_tag_name, current_version):
+            return None
+
+        return {
+            "download_url": download_url,
+            "tag_name": latest_tag_name,
+            "latest_version": latest_version,
+            "needs_elevation": needs_elevation,
+            "is_msi": latest_release_info.get("is_msi", False),
+            "is_appimage": latest_release_info.get("is_appimage", False),
+            "is_tar_gz": latest_release_info.get("is_tar_gz", False),
+        }
+
+    def _parse_current_version(self, current_version: str) -> version.Version | None:
+        """
+        Parse the installed version, including RimSort's Edge prerelease format.
+
+        Args:
+            current_version: The current version string
+
+        Returns:
+            Parsed version object, or None when the version cannot be compared
+        """
+        try:
+            normalized = EDGE_VERSION_PATTERN.sub(r"\1.dev\2", current_version.strip())
+            return version.parse(normalized)
+        except version.InvalidVersion as e:
+            logger.warning(f"Failed to parse version '{current_version}': {e}")
+            return None
+
+    def _prompt_user_for_update(
+        self, latest_tag_name: str, current_version: str
+    ) -> bool:
+        """
+        Prompt the user to confirm the update.
+
+        Args:
+            latest_tag_name: The tag name of the latest release
+            current_version: The current version string
+
+        Returns:
+            True if user accepts update, False otherwise
+        """
+        answer = dialogue.show_dialogue_conditional(
+            title=self.tr("RimSort update found"),
+            text=self.tr(
+                "An update to RimSort has been released: {latest_tag_name}"
+            ).format(latest_tag_name=latest_tag_name),
+            information=self.tr(
+                "You are running RimSort {current_version}<br>Do you want to update now?"
+            ).format(current_version=current_version),
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _handle_update_process(self, update_info: dict[str, Any]) -> None:
+        """
+        Handle the actual update process: download, extract, and launch.
+
+        Args:
+            update_info: Dictionary containing update information
+        """
+        download_url = update_info["download_url"]
+        tag_name = update_info["tag_name"]
+
+        is_msi = bool(update_info.get("is_msi", False))
+        is_appimage = bool(update_info.get("is_appimage", False))
+        is_tar_gz = bool(update_info.get("is_tar_gz", False))
+
+        try:
+            self._perform_update(download_url, tag_name, is_msi, is_appimage, is_tar_gz)
+        except UpdateError as e:
+            logger.error(f"Update process failed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during update: {e}")
+            raise UpdateError(f"Update failed: {e}") from e
+
+    def _get_latest_release_info(
+        self, needs_elevation: bool = False, *, quiet: bool = False
+    ) -> ReleaseInfo | None:
+        """
+        Get the latest release information from GitHub API.
+
+        Authenticated with the user's GitHub token when one is configured,
+        since the unauthenticated limit is only 60 requests per hour per IP
+        and is easily exhausted behind shared or NAT'd networks (#2337).
+
+        Args:
+            needs_elevation: Whether elevation is needed (affects Windows asset selection)
+            quiet: Log failures without showing dialogs, including from worker threads
+
+        Returns:
+            Dictionary containing version, tag_name, download_url, and is_msi flag, or None if failed
+        """
+        token = getattr(self.settings, "github_token", "")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            # Use releases API for better asset information
+            fetch_release = partial(
+                http.get, GITHUB_API_URL, timeout=API_TIMEOUT, headers=headers
+            )
+            if quiet:
+                response = fetch_release()
+            else:
+                response = self.main_content.do_threaded_loading_animation(
+                    gif_path=str(
+                        AppInfo().theme_data_folder / "default-icons" / "rimsort.gif"
+                    ),
+                    target=fetch_release,
+                    text=self.tr("Checking for RimSort updates..."),
+                )
+            if response is None:
+                return None
+            response.raise_for_status()
+            release_data = response.json()
+
+            if release_data.get("draft", False) or release_data.get(
+                "prerelease", False
+            ):
+                logger.warning("Ignoring a draft or prerelease update candidate")
+                if not quiet:
+                    self.show_update_error()
+                return None
+
+            tag_name = release_data.get("tag_name", "")
+            # Normalize tag name by removing prefix 'v' if present
+            normalized_tag = TAG_PREFIX_PATTERN.sub("", str(tag_name))
+
+            # Parse version
+            try:
+                latest_version = version.parse(normalized_tag)
+                if latest_version.is_prerelease:
+                    raise version.InvalidVersion("Update candidate is not stable")
+            except Exception as e:
+                logger.warning(f"Failed to parse version from tag {tag_name}: {e}")
+                if not quiet:
+                    self.show_update_error()
+                return None
+
+            # Get platform-specific download URL
+            download_info = self._get_platform_download_url(
+                release_data.get("assets", []), needs_elevation
+            )
+            if not download_info:
+                logger.warning("No compatible application release asset found")
+                if not quiet:
+                    system_info = f"{platform.system()} {platform.architecture()[0]} {platform.machine()}"
+                    information = self.tr(
+                        'No compatible update download was found. Your installation has not been changed.<br><br>Check <a href="https://github.com/RimSort/RimSort/releases">RimSort releases</a> for a download matching your operating system and CPU architecture.'
+                    )
+                    if AppInfo().is_appimage:
+                        information += self.tr(
+                            "<br><br>AppImage installations require a compatible AppImage download."
+                        )
+                    dialogue.show_warning(
+                        title=self.tr(ERR_NO_VALID_RELEASE_TITLE),
+                        text=self.tr(ERR_NO_VALID_RELEASE_TEXT).format(
+                            system_info=system_info
+                        ),
+                        information=information,
+                    )
+                return None
+
+            return {
+                "version": latest_version,
+                "tag_name": tag_name,
+                "download_url": download_info["url"],
+                "is_msi": download_info.get("is_msi", False),
+                "is_appimage": download_info.get("is_appimage", False),
+                "is_tar_gz": download_info.get("is_tar_gz", False),
+            }
+
+        except requests.HTTPError as e:
+            if quiet:
+                logger.warning(f"Failed to fetch release information: {e}")
+                return None
+            if is_github_rate_limit_error(e):
+                logger.warning(f"GitHub API rate limit reached: {e}")
+                clock = rate_limit_reset_clock(getattr(e, "response", None))
+                reset = (
+                    self.tr("Requests will be accepted again {when}.").format(
+                        when=clock
+                    )
+                    if clock
+                    else ""
+                )
+                dialogue.show_warning(
+                    title=self.tr("RimSort Update Error"),
+                    text=self.tr("GitHub's API rate limit has been reached"),
+                    information=self.tr(
+                        "Too many requests were sent from your network, so GitHub"
+                        " declined this update check. Nothing is wrong with your"
+                        " installation.<br><br>{reset}<br><br>Adding a GitHub"
+                        " personal access token under Settings - Advanced raises"
+                        " the limit substantially and usually removes this."
+                    ).format(reset=reset),
+                )
+            else:
+                logger.warning(f"Failed to fetch release information: {e}")
+                dialogue.show_warning(
+                    title=self.tr(ERR_API_CONNECTION_TITLE),
+                    text=self.tr(ERR_API_CONNECTION_TEXT).format(error=str(e)),
+                )
+            return None
+        except requests.RequestException as e:
+            logger.warning(f"Failed to fetch release information: {e}")
+            if not quiet:
+                dialogue.show_warning(
+                    title=self.tr(ERR_API_CONNECTION_TITLE),
+                    text=self.tr(ERR_API_CONNECTION_TEXT).format(error=str(e)),
+                )
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error fetching release info: {e}")
+            if not quiet:
+                self.show_update_error()
+            return None
+
+    def _asset_matches(
+        self,
+        asset: dict[str, Any],
+        patterns: list[str],
+        extension: str,
+        require_arch: bool = False,
+        arch_patterns: list[str] | None = None,
+    ) -> bool:
+        """
+        Check if an asset matches the given patterns and extension.
+
+        Args:
+            asset: Asset dictionary from GitHub API
+            patterns: List of patterns to match
+            extension: File extension to check
+            require_arch: Whether to require architecture match
+            arch_patterns: Architecture patterns if require_arch is True
+
+        Returns:
+            True if asset matches, False otherwise
+        """
+        asset_name = asset.get("name", "")
+        if isinstance(asset_name, list):
+            asset_name = " ".join(asset_name)
+        elif not isinstance(asset_name, str):
+            asset_name = str(asset_name)
+        asset_name_lower = asset_name.lower()
+
+        # Early return if extension doesn't match
+        if not asset_name_lower.endswith(extension.lower()):
+            return False
+
+        # Check system patterns
+        if patterns and not any(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(pattern.lower())}(?![a-z0-9])",
+                asset_name_lower,
+            )
+            for pattern in patterns
+        ):
+            return False
+
+        # Release filenames end in the architecture before the package extension.
+        if require_arch:
+            stem = asset_name_lower[: -len(extension)]
+            return bool(arch_patterns) and any(
+                re.search(rf"(?<![a-z0-9]){re.escape(pattern.lower())}$", stem)
+                for pattern in arch_patterns or []
+            )
+        return True
+
+    def _get_platform_download_url(
+        self, assets: list[dict[str, Any]], needs_elevation: bool = False
+    ) -> DownloadInfo | None:
+        """
+        Get the appropriate download URL for the current platform.
+
+        Args:
+            assets: List of asset dictionaries from GitHub API
+            needs_elevation: Whether elevation is needed (affects Windows asset selection)
+
+        Returns:
+            Dictionary with 'url', 'name', and 'is_msi' keys, or None if not found
+        """
+        if self._cached_patterns is None:
+            logger.warning(f"Unsupported system: {self._system}")
+            return None
+
+        system_patterns = cast(list[str], self._cached_patterns["patterns"])
+        arch_patterns_dict = cast(
+            dict[str, list[str]], self._cached_patterns["arch_patterns"]
+        )
+        arch_patterns = arch_patterns_dict.get(self._arch.lower(), [])
+
+        # AppImage installations must be replaced with another AppImage.
+        if self._system == "Linux" and AppInfo().is_appimage:
+            return self._find_appimage_asset(assets, arch_patterns)
+
+        # Determine preferred extension order
+        if self._system == "Windows" and self._is_in_protected_path():
+            preferred_order = [MSI_EXTENSION, ZIP_EXTENSION]
+        elif self._system == "Windows":
+            preferred_order = [ZIP_EXTENSION, MSI_EXTENSION]
+        else:
+            preferred_order = [TAR_GZ_EXTENSION, ZIP_EXTENSION]
+
+        logger.debug(
+            f"Looking for asset matching system={self._system}, arch={self._arch}, patterns={system_patterns + arch_patterns}, order={preferred_order}"
+        )
+
+        for ext in preferred_order:
+            candidate = self._find_best_asset_match(
+                assets, system_patterns, arch_patterns, ext
+            )
+            if candidate:
+                return candidate
+
+        logger.warning(
+            f"No matching asset found for {self._system} {self._arch} with extensions order {preferred_order}"
+        )
+        return None
+
+    def _find_best_asset_match(
+        self,
+        assets: list[dict[str, Any]],
+        system_patterns: list[str],
+        arch_patterns: list[str],
+        preferred_extension: str,
+    ) -> DownloadInfo | None:
+        """
+        Find the best matching asset from the list.
+
+        Args:
+            assets: List of asset dictionaries
+            system_patterns: System name patterns to match
+            arch_patterns: Architecture patterns to match
+            preferred_extension: Preferred file extension (.zip or .msi)
+
+        Returns:
+            Dictionary with 'url', 'name', and 'is_msi' keys, or None if no match
+        """
+        for asset in assets:
+            asset_name = str(asset.get("name", ""))
+            download_url = asset.get("browser_download_url")
+
+            if (
+                download_url
+                and arch_patterns
+                and self._asset_matches(
+                    asset,
+                    system_patterns,
+                    preferred_extension,
+                    require_arch=True,
+                    arch_patterns=arch_patterns,
+                )
+            ):
+                logger.debug(
+                    f"Found arch-specific matching asset: {asset_name} -> {download_url}"
+                )
+                return cast(
+                    DownloadInfo,
+                    {
+                        "url": str(download_url),
+                        "name": asset_name,
+                        "is_msi": preferred_extension == MSI_EXTENSION,
+                        "is_appimage": preferred_extension == APPIMAGE_EXTENSION,
+                        "is_tar_gz": preferred_extension == TAR_GZ_EXTENSION,
+                    },
+                )
+
+        return None
+
+    def _find_appimage_asset(
+        self,
+        assets: list[dict[str, Any]],
+        arch_patterns: list[str],
+    ) -> DownloadInfo | None:
+        """
+        Find an AppImage asset from the release.
+
+        AppImage filenames use the format ``RimSort-{version}-{arch}.AppImage``
+        and don't contain "Linux"/"Ubuntu", so require the package extension
+        and architecture without a system-name token.
+        """
+        return self._find_best_asset_match(
+            assets, [], arch_patterns, APPIMAGE_EXTENSION
+        )
+
+    def _on_download_cancel(self) -> None:
+        self._download_cancelled = True
+
+    def _download_update_worker(self, url: str) -> None:
+        try:
+            self._download_update(url)
+            self.download_complete.emit(True, "")
+        except Exception as e:
+            self.download_complete.emit(False, str(e))
+
+    def _perform_update(
+        self,
+        download_url: str,
+        tag_name: str,
+        is_msi: bool,
+        is_appimage: bool = False,
+        is_tar_gz: bool = False,
+    ) -> None:
+        """
+        Download and extract the update, then launch the update script.
+
+        Args:
+            download_url: URL to download the update from
+            tag_name: Tag name of the release
+            is_msi: Whether the update is an MSI installer
+            is_appimage: Whether the update is an AppImage file
+            is_tar_gz: Whether the update is a tar.gz archive
+        """
+        try:
+            logger.debug(
+                f"Downloading & extracting RimSort release from: {download_url}"
+            )
+
+            # Download with progress widget
+            self._download_cancelled = False
+            self._progress_widget = TaskProgressWindow(
+                title="RimSort Update",
+                show_message=True,
+                show_percent=True,
+            )
+            self._progress_widget.update_progress(
+                0,
+                self.tr("Downloading RimSort {tag_name} release...").format(
+                    tag_name=tag_name
+                ),
+            )
+            self._progress_widget.cancel_requested.connect(self._on_download_cancel)
+            self.update_progress.connect(self._progress_widget.update_progress)
+
+            download_result: dict[str, Any] = {"success": False, "error": ""}
+            loop = QEventLoop()
+
+            def on_complete(success: bool, error: str) -> None:
+                download_result["success"] = success
+                download_result["error"] = error
+                loop.quit()
+                try:
+                    if self._progress_widget:
+                        self._progress_widget.close()
+                        # Remove from panel if it was added there
+                        if self.mod_info_panel:
+                            self.mod_info_panel.panel.removeWidget(
+                                self._progress_widget
+                            )
+                except Exception:  # noqa: S110
+                    pass
+
+            self.download_complete.connect(on_complete)
+
+            worker = threading.Thread(
+                target=self._download_update_worker, args=(download_url,), daemon=True
+            )
+            worker.start()
+
+            # Show progress widget in panel or as standalone window
+            if self.mod_info_panel:
+                self.mod_info_panel.info_panel_frame.hide()
+                if hasattr(self.main_content, "disable_enable_widgets_signal"):
+                    self.main_content.disable_enable_widgets_signal.emit(False)
+                self.mod_info_panel.panel.addWidget(self._progress_widget)
+                self._progress_widget.show()
+            else:
+                self._progress_widget.show()
+
+            # Wait for download to complete without blocking event loop
+            loop.exec()
+
+            if not download_result["success"] or self._update_content is None:
+                if self._download_cancelled:
+                    raise UpdateDownloadError("Download cancelled by user")
+                raise UpdateDownloadError(
+                    download_result["error"] or "Download did not complete successfully"
+                )
+
+            update_source_path: Path | None
+            if is_appimage:
+                # AppImage: write the downloaded file directly, no extraction needed
+                update_source_path = self._prepare_appimage_update()
+            else:
+                # Extract or save with progress window
+                try:
+                    self._extract_update_with_progress(is_msi, is_tar_gz)
+                except _NormalizationCancelled:
+                    raise
+                except Exception as e:
+                    logger.error(f"Extraction/preparation failed: {e}")
+                    raise UpdateExtractionError(f"Extraction failed: {e!s}") from e
+
+                update_source_path = self._extracted_path
+
+            logger.info(f"Update prepared at: {update_source_path}")
+
+            if update_source_path is None:
+                raise UpdateExtractionError(
+                    "Extraction/preparation did not complete successfully"
+                )
+
+            # Confirm installation
+            answer = dialogue.show_dialogue_conditional(
+                title=self.tr("Update downloaded"),
+                text=self.tr("Do you want to proceed with the update?"),
+                information=self.tr(
+                    "<br>Successfully retrieved latest release.<br>The update will be installed from: {update_source_path}"
+                ).format(update_source_path=update_source_path),
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                logger.info("User declined update")
+                # Clean up the staged AppImage file if the user declined
+                if is_appimage and update_source_path.exists():
+                    try:
+                        update_source_path.unlink()
+                        logger.debug(
+                            f"Cleaned up declined AppImage update: {update_source_path}"
+                        )
+                    except OSError as e:
+                        logger.warning(f"Failed to clean up {update_source_path}: {e}")
+                # Restore panel if it was hidden
+                if self.mod_info_panel:
+                    self.mod_info_panel.info_panel_frame.show()
+                return
+
+            # AppImage updates use .bak rename as the backup — skip ZIP backup
+            if (
+                not is_appimage
+                and self.settings.enable_backup_before_update
+                and not self._create_backup_with_progress()
+            ):
+                return
+
+            # Prepare for update script execution
+            logger.info("Preparing to launch update...")
+            log_path = self._prepare_update_log(self._system)
+            needs_elevation = self._check_needs_elevation()
+
+            # Launch update script or MSI installer
+            self._launch_update_script(
+                update_source_path, log_path, needs_elevation, is_msi
+            )
+
+        except _NormalizationCancelled:
+            logger.info("Update stopped because the application is shutting down")
+        except UpdateDownloadError as e:
+            logger.exception("Update download failed")
+            dialogue.show_warning(
+                title=self.tr(ERR_DOWNLOAD_FAILED_TITLE),
+                text=self.tr(ERR_DOWNLOAD_FAILED_TEXT),
+                information=f"Error: {e!s}<br>URL: {download_url}",
+            )
+        except UpdateExtractionError as e:
+            logger.exception("Update extraction failed")
+            dialogue.show_warning(
+                title=self.tr(ERR_EXTRACTION_FAILED_TITLE),
+                text=self.tr(ERR_EXTRACTION_FAILED_TEXT),
+                information=f"Error: {e!s}",
+            )
+        except UpdateScriptLaunchError as e:
+            logger.exception("Update script launch failed")
+            dialogue.show_warning(
+                title=self.tr(ERR_LAUNCH_FAILED_TITLE),
+                text=self.tr(ERR_LAUNCH_FAILED_TEXT),
+                information=f"Error: {e!s}",
+            )
+        except Exception as e:
+            logger.exception("Unexpected update process failure")
+            dialogue.show_warning(
+                title=self.tr(ERR_UPDATE_FAILED_TITLE),
+                text=self.tr(ERR_UPDATE_FAILED_TEXT),
+                information=f"Error: {e!s}<br>URL: {download_url}",
+                details=traceback.format_exc(),
+            )
+        finally:
+            # Always restore the panel if it was hidden
+            if self.mod_info_panel:
+                try:
+                    self.mod_info_panel.info_panel_frame.show()
+                    if hasattr(self.main_content, "disable_enable_widgets_signal"):
+                        self.main_content.disable_enable_widgets_signal.emit(True)
+                except Exception:  # noqa: S110
+                    pass
+
+    def _get_file_size(self, url: str) -> int:
+        """
+        Get the file size from the URL for progress tracking.
+
+        Args:
+            url: URL to check
+
+        Returns:
+            File size in bytes, or 0 if unable to determine
+        """
+        try:
+            head_response = http.head(url, timeout=API_TIMEOUT, allow_redirects=True)
+            return int(head_response.headers.get("content-length", 0))
+        except Exception as e:
+            logger.debug(f"Failed to get file size: {e}")
+            return 0
+
+    def _format_size(self, n: int) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(n)
+        i = 0
+        while size >= 1024 and i < len(units) - 1:
+            size /= 1024.0
+            i += 1
+        if i == 0:
+            return f"{int(size)} {units[i]}"
+        return f"{size:.1f} {units[i]}"
+
+    def _download_with_progress(
+        self, response: requests.Response, total_size: int
+    ) -> bytes:
+        """
+        Download content with progress tracking.
+
+        Args:
+            response: Streaming response object
+            total_size: Total file size for progress calculation
+
+        Returns:
+            Downloaded content as bytes
+        """
+        content = bytearray()
+        downloaded_size = 0
+        chunk_count = 0
+        downloaded_since_last_emit = 0
+        start_time = datetime.now()  # noqa: DTZ005
+
+        if total_size <= 0:
+            self.update_progress.emit(-1, "Downloading...")
+
+        for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+            if self._download_cancelled:
+                raise UpdateDownloadError("Download cancelled by user")
+            if chunk:
+                content.extend(chunk)
+                downloaded_size += len(chunk)
+                chunk_count += 1
+                downloaded_since_last_emit += len(chunk)
+
+                # Emit progress approximately every 512KB
+                emit_update = downloaded_since_last_emit >= 512 * 1024
+
+                if emit_update:
+                    elapsed = (datetime.now() - start_time).total_seconds()  # noqa: DTZ005
+                    speed = downloaded_size / elapsed if elapsed > 0 else 0
+
+                    if total_size > 0:
+                        progress = (downloaded_size / total_size) * 100
+                        logger.debug(
+                            f"Download progress: {progress:.1f}% ({downloaded_size}/{total_size} bytes) - Speed: {speed:.2f} B/s"
+                        )
+                        self.update_progress.emit(
+                            int(progress),
+                            f"Downloading... {progress:.1f}% ({self._format_size(downloaded_size)}/{self._format_size(total_size)})",
+                        )
+                    else:  # total_size <= 0
+                        self.update_progress.emit(
+                            -1,
+                            f"Downloading... {self._format_size(downloaded_size)}",
+                        )
+
+                    downloaded_since_last_emit = 0  # reset counter
+
+        total_time = (datetime.now() - start_time).total_seconds()  # noqa: DTZ005
+        avg_speed = len(content) / total_time if total_time > 0 else 0
+        logger.debug(
+            f"Downloaded {len(content)} bytes in {chunk_count} chunks over {total_time:.2f}s (avg speed: {avg_speed:.2f} B/s)"
+        )
+        if self._download_cancelled:
+            raise UpdateDownloadError("Download cancelled by user")
+
+        if total_size > 0:
+            self.update_progress.emit(100, "Download complete")
+        else:
+            self.update_progress.emit(
+                100, f"Download complete ({self._format_size(len(content))})"
+            )
+        return bytes(content)
+
+    def _validate_download(self, content: bytes) -> None:
+        """
+        Validate downloaded content.
+
+        Args:
+            content: Downloaded content
+
+        Raises:
+            UpdateDownloadError: If validation fails
+        """
+        if len(content) == 0:
+            raise UpdateDownloadError("Downloaded file is empty")
+        if len(content) < MIN_UPDATE_SIZE:
+            raise UpdateDownloadError(
+                f"Downloaded file too small ({len(content)} bytes)"
+            )
+
+    def _download_update(self, url: str) -> None:
+        """
+        Download the update to memory using requests with progress tracking.
+
+        Args:
+            url: URL to download from
+
+        Raises:
+            UpdateDownloadError: If download fails
+        """
+        logger.info(f"Starting download from URL: {url}")
+        try:
+            # Get file size first for progress tracking
+            total_size = self._get_file_size(url)
+            if total_size:
+                logger.info(f"File size: {total_size / (1024 * 1024):.2f} MB")
+
+            response = http.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+            response.raise_for_status()
+            logger.debug(f"HTTP response status: {response.status_code}")
+
+            # Download with progress tracking
+            content = self._download_with_progress(response, total_size)
+
+            # Validate downloaded content
+            self._validate_download(content)
+
+            self._update_content = content
+            logger.info("Update downloaded and validated successfully")
+
+        except requests.RequestException as e:
+            logger.error(f"Download failed: {e}")
+            raise UpdateDownloadError(f"Failed to download update: {e}") from e
+        except UpdateError:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during download: {e}")
+            raise UpdateDownloadError(f"Failed to download update: {e}") from e
+
+    def _create_temp_dir(self) -> Path:
+        """
+        Create a unique temporary directory for update extraction.
+
+        Returns:
+            Path to the created temporary directory
+        """
+        temp_base = Path(gettempdir()) / f"RimSort_update_{uuid4().hex}"
+        temp_base.mkdir()
+        return temp_base
+
+    def _extract_zip(self, content: bytes, temp_base: Path) -> int:
+        """
+        Extract ZIP content to the temporary directory using ZipExtractThread with UI progress.
+
+        Args:
+            content: ZIP file content as bytes
+            temp_base: Temporary directory to extract to
+
+        Returns:
+            Number of files extracted
+
+        Raises:
+            UpdateExtractionError: If ZIP is corrupted or extraction fails
+        """
+        logger.info("Extracting update from ZIP")
+
+        # Write content to temporary ZIP file for extraction
+        temp_zip_path = temp_base.parent / f"{temp_base.name}.zip"
+        temp_zip_path.write_bytes(content)
+
+        try:
+            # Validate ZIP integrity
+            is_valid, error_msg = validate_zip_integrity(temp_zip_path)
+            if not is_valid:
+                logger.error(f"ZIP validation failed: {error_msg}")
+                raise UpdateExtractionError(error_msg)
+
+            # Get ZIP contents
+            zip_contents = get_zip_contents(temp_zip_path)
+            extracted_files = len(zip_contents)
+            logger.info(f"ZIP contains {extracted_files} files")
+
+            # Create and display extraction progress widget
+            self._progress_widget = TaskProgressWindow(
+                title="Extracting Update",
+                show_message=True,
+                show_percent=True,
+            )
+            self._progress_widget.set_message("Extracting files...")
+
+            # Show progress widget in panel or as standalone window
+            if self.mod_info_panel:
+                self.mod_info_panel.info_panel_frame.hide()
+                self.mod_info_panel.panel.addWidget(self._progress_widget)
+                self._progress_widget.show()
+            else:
+                self._progress_widget.show()
+
+            # Create and run extraction thread
+            extraction_result: dict[str, Any] = {
+                "success": False,
+                "error": "",
+                # jscpd:ignore-start
+                "done": False,
+            }
+            loop = QEventLoop()
+
+            def on_extraction_progress(percent: int, message: str) -> None:
+                if self._progress_widget:
+                    self._progress_widget.update_progress(percent, message)
+
+            def on_extraction_finished(success: bool, message: str) -> None:
+                extraction_result["success"] = success
+                extraction_result["error"] = message
+                # jscpd:ignore-end
+                # jscpd:ignore-start
+                extraction_result["done"] = True
+                loop.quit()
+                try:
+                    if self._progress_widget:
+                        self._progress_widget.close()
+                        # Remove from panel if it was added there
+                        if self.mod_info_panel:
+                            self.mod_info_panel.panel.removeWidget(
+                                self._progress_widget
+                            )
+                            # Restore panel visibility
+                            # jscpd:ignore-end
+                            self.mod_info_panel.info_panel_frame.show()
+                except Exception as e:
+                    logger.debug(f"Error closing progress widget: {e}")
+
+            extract_thread = ZipExtractThread(
+                zip_path=str(temp_zip_path),
+                target_path=str(temp_base),
+                overwrite_all=True,
+                delete=True,
+            )
+            extract_thread.progress.connect(on_extraction_progress)
+            extract_thread.finished.connect(on_extraction_finished)
+            extract_thread.start()
+
+            # Wait for extraction to complete without blocking event loop
+            loop.exec()
+
+            # Ensure thread is properly cleaned up before continuing
+            extract_thread.wait(EXTRACTION_THREAD_TIMEOUT_MS)
+            # jscpd:ignore-start
+            if extract_thread.isRunning():
+                logger.warning(
+                    "Extraction thread still running after timeout, forcing quit"
+                )
+                extract_thread.quit()
+                extract_thread.wait(2000)  # Final attempt to stop thread
+
+            if not extraction_result["success"]:
+                raise UpdateExtractionError(
+                    f"Extraction failed: {extraction_result['error']}"
+                )
+
+            logger.info(f"Extracted {extracted_files} files from ZIP")
+            return extracted_files
+
+        except BadZipFile as e:
+            raise UpdateExtractionError(f"Invalid ZIP file: {e}") from e
+        # jscpd:ignore-end
+        finally:
+            # Clean up temporary ZIP file if it still exists
+            if temp_zip_path.exists():
+                try:
+                    temp_zip_path.unlink()
+                except Exception as e:
+                    logger.debug(f"Failed to clean up temp ZIP file: {e}")
+
+    def _extract_tar_gz(self, content: bytes, temp_base: Path) -> int:
+        """
+        Extract tar.gz content to the temporary directory using
+        TarExtractThread with UI progress.
+
+        Mirrors the QThread + QEventLoop pattern used by :meth:`_extract_zip`
+        so the UI stays responsive and extraction can be aborted.
+
+        Args:
+            content: tar.gz file content as bytes
+            temp_base: Temporary directory to extract to
+
+        Returns:
+            Number of entries extracted
+
+        Raises:
+            UpdateExtractionError: If the archive is corrupt or extraction fails
+        """
+        logger.info("Extracting update from tar.gz")
+
+        temp_tar_path = temp_base.parent / f"{temp_base.name}.tar.gz"
+        temp_tar_path.write_bytes(content)
+
+        try:
+            # Validate and count members before spawning the thread
+            try:
+                with tarfile.open(temp_tar_path, "r:gz") as tf:
+                    extracted_files = len(tf.getmembers())
+            except tarfile.TarError as e:
+                raise UpdateExtractionError(f"Invalid tar.gz archive: {e}") from e
+
+            if extracted_files == 0:
+                raise UpdateExtractionError("tar.gz archive is empty")
+
+            logger.info(f"tar.gz contains {extracted_files} entries")
+
+            # Create and display extraction progress widget
+            self._progress_widget = TaskProgressWindow(
+                title="Extracting Update",
+                show_message=True,
+                show_percent=True,
+            )
+            self._progress_widget.set_message("Extracting files...")
+
+            # jscpd:ignore-start
+            if self.mod_info_panel:
+                self.mod_info_panel.info_panel_frame.hide()
+                self.mod_info_panel.panel.addWidget(self._progress_widget)
+                self._progress_widget.show()
+            else:
+                self._progress_widget.show()
+
+            # Create and run extraction thread
+            extraction_result: dict[str, Any] = {
+                "success": False,
+                "error": "",
+                # jscpd:ignore-end
+            }
+            loop = QEventLoop()
+
+            def on_extraction_progress(percent: int, message: str) -> None:
+                if self._progress_widget:
+                    self._progress_widget.update_progress(percent, message)
+
+            def on_extraction_finished(success: bool, message: str) -> None:
+                extraction_result["success"] = success
+                extraction_result["error"] = message
+                loop.quit()
+                try:
+                    if self._progress_widget:
+                        self._progress_widget.close()
+                        if self.mod_info_panel:
+                            self.mod_info_panel.panel.removeWidget(
+                                self._progress_widget
+                            )
+                            self.mod_info_panel.info_panel_frame.show()
+                except Exception as e:
+                    logger.debug(f"Error closing progress widget: {e}")
+
+            extract_thread = TarExtractThread(
+                tar_path=str(temp_tar_path),
+                target_path=str(temp_base),
+            )
+            extract_thread.progress.connect(on_extraction_progress)
+            extract_thread.finished.connect(on_extraction_finished)
+            extract_thread.start()
+
+            # Wait for extraction to complete without blocking event loop
+            loop.exec()
+
+            # Ensure thread is properly cleaned up before continuing
+            extract_thread.wait(EXTRACTION_THREAD_TIMEOUT_MS)
+            if extract_thread.isRunning():
+                logger.warning(
+                    "Extraction thread still running after timeout, forcing quit"
+                )
+                extract_thread.quit()
+                extract_thread.wait(2000)
+
+            if not extraction_result["success"]:
+                raise UpdateExtractionError(
+                    f"Extraction failed: {extraction_result['error']}"
+                )
+
+            logger.info(f"Extracted {extracted_files} entries from tar.gz")
+            return extracted_files
+
+        finally:
+            if temp_tar_path.exists():
+                try:
+                    temp_tar_path.unlink()
+                except Exception as e:
+                    logger.debug(f"Failed to clean up temp tar.gz file: {e}")
+
+    def _normalize_structure(self, temp_base: Path, extracted_files: int) -> None:
+        """
+        Normalize the extracted structure by moving contents to root if wrapped.
+
+        Args:
+            temp_base: Temporary directory containing extracted files
+            extracted_files: Number of files extracted
+        """
+        logger.info("Normalizing extracted structure")
+
+        # Create and display normalization progress widget
+        self._progress_widget = TaskProgressWindow(
+            title="Normalizing Update",
+            show_message=True,
+            show_percent=False,
+        )
+        self._progress_widget.set_message("Normalizing extracted structure...")
+
+        # Show progress widget in panel or as standalone window
+        if self.mod_info_panel:
+            self.mod_info_panel.info_panel_frame.hide()
+            self.mod_info_panel.panel.addWidget(self._progress_widget)
+            self._progress_widget.show()
+        else:
+            self._progress_widget.show()
+
+        # Use a thread and event loop to keep UI responsive during normalization
+        normalization_result: dict[str, Any] = {"success": False, "error": None}
+        loop = QEventLoop()
+        application = QApplication.instance()
+        shutting_down = False
+
+        def on_application_quit() -> None:
+            nonlocal shutting_down
+            shutting_down = True
+            loop.quit()
+
+        def worker_func() -> None:
+            try:
+                self._normalize_extracted_structure(temp_base, extracted_files)
+                normalization_result["success"] = True
+            except Exception as e:
+                normalization_result["error"] = e
+            finally:
+                logger.debug("Structure normalization worker thread completed")
+                QMetaObject.invokeMethod(
+                    loop, "quit", Qt.ConnectionType.QueuedConnection
+                )
+
+        thread = threading.Thread(target=worker_func, daemon=False)
+        if application is not None:
+            application.aboutToQuit.connect(on_application_quit)
+        try:
+            thread.start()
+            if loop.exec() == -1:
+                # The quit signal may predate this operation's observer.
+                shutting_down = True
+        finally:
+            if thread.ident is not None:
+                thread.join()
+            if application is not None:
+                application.aboutToQuit.disconnect(on_application_quit)
+            try:
+                if self._progress_widget:
+                    self._progress_widget.close()
+                    # Remove from panel if it was added there
+                    if self.mod_info_panel:
+                        self.mod_info_panel.panel.removeWidget(self._progress_widget)
+                        # Restore panel visibility
+                        if not shutting_down:
+                            self.mod_info_panel.info_panel_frame.show()
+            except Exception:  # noqa: S110
+                pass
+
+        if shutting_down:
+            raise _NormalizationCancelled(
+                "Structure normalization interrupted by application shutdown"
+            ) from normalization_result["error"]
+
+        if not normalization_result["success"]:
+            error = normalization_result["error"]
+            if isinstance(error, UpdateExtractionError):
+                raise error
+            raise UpdateExtractionError(
+                f"Structure normalization failed: {error}"
+            ) from error
+
+        logger.debug(f"Normalized update ready at: {temp_base}")
+
+    def _prepare_appimage_update(self) -> Path:
+        """
+        Write the downloaded AppImage content to a ``.new`` file next to the
+        running AppImage.  The file is placed in the same directory to ensure
+        atomic renames in ``update.sh``.
+
+        :return: Path to the new AppImage file.
+        :raises UpdateExtractionError: If the AppImage path is unknown or
+            the target directory is not writable.
+        """
+        appimage_path = AppInfo().appimage_path
+        if appimage_path is None:
+            raise UpdateExtractionError(
+                "Cannot determine AppImage path from environment"
+            )
+
+        if self._update_content is None:
+            raise UpdateExtractionError("No update content available")
+
+        new_path = appimage_path.with_suffix(appimage_path.suffix + ".new")
+        target_dir = appimage_path.parent
+
+        if not os.access(target_dir, os.W_OK):
+            raise UpdateExtractionError(
+                f"Cannot update: no write permission to {target_dir}. "
+                "Move RimSort to a user-writable location or update manually."
+            )
+
+        logger.info(f"Writing new AppImage to: {new_path}")
+        new_path.write_bytes(self._update_content)
+        os.chmod(new_path, 0o755)
+        self._extracted_path = new_path
+        logger.info(f"AppImage prepared ({len(self._update_content)} bytes)")
+        return new_path
+
+    def _extract_update(self, is_msi: bool = False, is_tar_gz: bool = False) -> Path:
+        """
+        Extract the downloaded update to a dedicated temporary directory and normalize structure,
+        or save MSI file to temp location.
+
+        Args:
+            is_msi: Whether the update is an MSI installer (don't extract, just save)
+            is_tar_gz: Whether the update is a tar.gz archive
+
+        Raises:
+            UpdateExtractionError: If extraction or saving fails
+        """
+        logger.info("Extracting update")
+        try:
+            if self._update_content is None:
+                logger.error("No update content available")
+                raise UpdateExtractionError(
+                    "No update content available for extraction"
+                )
+
+            if is_msi:
+                # For MSI, just save the file to temp location
+                temp_base = self._create_temp_dir()
+                msi_path = temp_base / "RimSort_Update.msi"
+                msi_path.write_bytes(self._update_content)
+                logger.info("MSI prepared")
+                self._extracted_path = msi_path
+                return msi_path
+            else:
+                temp_base = self._create_temp_dir()
+
+                if is_tar_gz:
+                    extracted_files = self._extract_tar_gz(
+                        self._update_content, temp_base
+                    )
+                else:
+                    extracted_files = self._extract_zip(self._update_content, temp_base)
+                logger.info(f"Extracted {extracted_files} files")
+
+                # Normalize structure
+                self._normalize_structure(temp_base, extracted_files)
+
+                logger.info("Update extraction complete")
+
+                self._extracted_path = temp_base
+                return temp_base
+
+        except BadZipFile as e:
+            logger.error(f"Invalid ZIP file: {e}")
+            raise UpdateExtractionError(
+                f"Downloaded file is not a valid ZIP archive: {e}"
+            ) from e
+        except UpdateError:
+            raise
+        except Exception as e:
+            logger.error(f"Extraction failed: {e}")
+            raise UpdateExtractionError(f"Failed to extract update: {e}") from e
+
+    def _should_unwrap_directory(self, top_dir: Path) -> bool:
+        """
+        Determine if a directory should be unwrapped based on platform-specific rules.
+
+        Args:
+            top_dir: The directory to check
+
+        Returns:
+            True if the directory should be unwrapped, False otherwise
+        """
+        top_dir_name = top_dir.name.lower()
+
+        # Platform-specific preserve rules take priority over generic patterns.
+        # On macOS the .app bundle must not be unwrapped even though its name
+        # contains the substring "app".
+        if self._system == "Darwin":
+            return not top_dir_name.endswith(".app")
+        elif self._system == "Linux":
+            if top_dir_name in ["rimsort", "rimsort.app"]:
+                return False
+        elif self._system == "Windows":
+            pass
+
+        # Common wrapper patterns
+        if any(
+            keyword in top_dir_name for keyword in ["app", "application", "release"]
+        ):
+            return True
+
+        # Version-like directory names
+        if VERSION_PATTERN.match(top_dir_name):
+            return True
+
+        return self._system == "Windows"
+
+    def _move_directory_contents(self, source_dir: Path, dest_dir: Path) -> int:
+        """
+        Move all contents from source directory to destination directory safely.
+
+        Args:
+            source_dir: Source directory to move contents from
+            dest_dir: Destination directory to move contents to
+
+        Returns:
+            Number of items successfully moved
+
+        Raises:
+            OSError: If an item cannot be moved
+        """
+        moved_items = 0
+        for item in source_dir.iterdir():
+            dest = dest_dir / item.name
+            if dest.exists():
+                if dest.is_dir():
+                    shutil.rmtree(dest)
+                else:
+                    dest.unlink()
+            # Move item to the specific destination path (not just to the directory)
+            shutil.move(str(item), str(dest))
+            moved_items += 1
+        return moved_items
+
+    def _validate_executable_presence(
+        self, extract_path: Path, children: list[Path]
+    ) -> None:
+        """
+        Validate that the expected executable is present in the extracted structure.
+
+        Args:
+            extract_path: Path to the extracted contents
+            children: List of child paths in extract_path
+
+        Raises:
+            UpdateExtractionError: If executable is not found
+        """
+        expected_executable = "RimSort.exe" if self._system == "Windows" else "RimSort"
+        executable_found = False
+
+        if self._system == "Darwin":
+            # Look for .app bundle
+            for child in children:
+                if child.is_dir() and child.name.endswith(".app"):
+                    app_bundle = child
+                    executable_path = (
+                        app_bundle / "Contents" / "MacOS" / expected_executable
+                    )
+                    if executable_path.exists():
+                        executable_found = True
+                        logger.info("Found macOS executable")
+                        break
+            if not executable_found:
+                logger.error("RimSort.app bundle not found")
+                raise UpdateExtractionError(
+                    "Expected RimSort.app bundle with executable not found after normalization"
+                )
+        else:
+            # Look for executable directly
+            executable_path = extract_path / expected_executable
+            if executable_path.exists():
+                executable_found = True
+                logger.info(f"Found executable: {expected_executable}")
+            else:
+                # Fallback: check if executable is in any subdirectory
+                for child in children:
+                    if child.is_dir():
+                        candidate_path = child / expected_executable
+                        if candidate_path.exists():
+                            executable_found = True
+                            logger.info("Found executable in subdirectory")
+                            break
+
+            if not executable_found:
+                logger.error(
+                    f"Expected executable '{expected_executable}' not found after normalization. Children: {[c.name for c in children]}"
+                )
+                # Log all files recursively for debugging
+                all_files = []
+                for root, dirs, files in os.walk(extract_path):
+                    for file in files:
+                        rel_path = os.path.relpath(
+                            os.path.join(root, file), extract_path
+                        )
+                        all_files.append(rel_path)
+                logger.error(
+                    f"All files in extract_path: {all_files[:50]}..."
+                )  # Limit to first 50
+                raise UpdateExtractionError(
+                    f"Expected executable '{expected_executable}' not found at expected location after normalization"
+                )
+
+    def _normalize_extracted_structure(
+        self, extract_path: Path, num_files: int
+    ) -> None:
+        """
+        Normalize the extracted ZIP structure by moving contents to root if wrapped.
+
+        Args:
+            extract_path: Path to the extracted contents
+            num_files: Number of files extracted (for validation)
+
+        Raises:
+            UpdateExtractionError: If normalization fails
+        """
+        try:
+            if not extract_path.exists():
+                raise UpdateExtractionError(
+                    "Extracted path does not exist after extraction"
+                )
+
+            children = list(extract_path.iterdir())
+            logger.debug(f"Initial extracted children: {[c.name for c in children]}")
+            if len(children) == 0:
+                raise UpdateExtractionError("No files extracted from ZIP")
+
+            # Check for common ZIP wrapping patterns, unwrap recursively if needed
+            while len(children) == 1 and children[0].is_dir():
+                top_dir = children[0]
+
+                if not self._should_unwrap_directory(top_dir):
+                    logger.debug(
+                        f"No unwrapping needed for '{top_dir.name}'; using existing structure"
+                    )
+                    break
+
+                logger.debug(
+                    f"Detected wrapped structure in '{top_dir.name}'; normalizing"
+                )
+                logger.debug(
+                    f"Wrapper '{top_dir.name}' children: {[c.name for c in top_dir.iterdir()]}"
+                )
+
+                # Move all contents from top_dir to extract_path
+                moved_items = self._move_directory_contents(top_dir, extract_path)
+
+                if moved_items == 0:
+                    logger.warning(
+                        "No items were successfully moved during normalization"
+                    )
+                    break
+
+                # Remove empty top_dir if possible
+                try:
+                    top_dir.rmdir()
+                    logger.debug("Structure normalized: contents moved to root")
+                except OSError as e:
+                    logger.warning(f"Failed to remove wrapper dir {top_dir}: {e}")
+
+                # Refresh children list after unwrapping
+                children = list(extract_path.iterdir())
+                logger.debug(
+                    f"Post-normalization children: {[c.name for c in children]}"
+                )
+
+            # Validate expected structure based on platform
+            self._validate_executable_presence(extract_path, children)
+        except Exception as e:
+            logger.error(f"Unexpected error during structure normalization: {e}")
+            logger.error(f"Extract path: {extract_path}")
+            logger.error(
+                f"Children: {[c.name for c in extract_path.iterdir()] if extract_path.exists() else 'N/A'}"
+            )
+            raise UpdateExtractionError(f"Structure normalization failed: {e!s}") from e
+
+    def _launch_update_script(
+        self,
+        update_source_path: Path,
+        log_path: Path,
+        needs_elevation: bool,
+        is_msi: bool = False,
+    ) -> None:
+        """
+        Launch the appropriate update script or MSI installer for the current platform.
+
+        This method has been refactored to separate platform-specific launch logic
+        into dedicated methods for better maintainability and separation of concerns.
+        """
+        # Stop watchdog before update
+        logger.info("Stopping watchdog Observer thread before update...")
+        self.main_content.stop_watchdog_signal.emit()
+
+        if is_msi:
+            if self._system != "Windows":
+                raise UpdateScriptLaunchError(
+                    "MSI installers are only supported on Windows"
+                )
+            # Validate MSI path
+            if not update_source_path.exists() or not update_source_path.is_file():
+                raise UpdateScriptLaunchError(
+                    f"MSI file not found or is not a file: {update_source_path}"
+                )
+            self._launch_msi_installer(update_source_path, log_path, needs_elevation)
+            return
+
+        try:
+            script_path, args_repr, _start_new_session, install_dir = (
+                self._get_script_info(update_source_path, log_path, needs_elevation)
+            )
+
+            # Validate script exists before proceeding
+            if not script_path.exists():
+                raise UpdateScriptLaunchError(f"Update script not found: {script_path}")
+
+            # For AppImage, the script lives inside the FUSE mount which goes
+            # away when the app exits.  Copy it to a temp location first.
+            if AppInfo().is_appimage:
+                fd, temp_script = tempfile.mkstemp(
+                    suffix=".sh", prefix="rimsort_update_"
+                )
+                os.close(fd)
+                shutil.copy2(str(script_path), temp_script)
+                os.chmod(temp_script, 0o755)
+                logger.debug(f"Copied update.sh out of AppImage to: {temp_script}")
+                script_path = Path(temp_script)
+
+                config = self._script_configs[self._system]
+                args_repr = config.get_args(
+                    script_path,
+                    update_source_path,
+                    log_path,
+                    needs_elevation,
+                    install_dir,
+                    update_manager=self,
+                )
+
+            # For Windows, copy update.bat to app_storage_folder to avoid conflicts during update
+            elif self._system == "Windows":
+                app_storage_folder = AppInfo().app_storage_folder
+                temp_script_path = app_storage_folder / "update.bat"
+
+                # Copy update.bat to app storage folder
+                try:
+                    shutil.copy2(str(script_path), str(temp_script_path))
+                    logger.debug(
+                        f"Copied update.bat to app storage: {temp_script_path}"
+                    )
+                    script_path = temp_script_path
+
+                    # Rebuild args with new script path
+                    config = self._script_configs[self._system]
+                    args_repr = config.get_args(
+                        script_path,
+                        update_source_path,
+                        log_path,
+                        needs_elevation,
+                        install_dir,
+                        update_manager=self,
+                    )
+                    logger.debug(f"Updated script path to: {script_path}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to copy update.bat to app storage, using original: {e}"
+                    )
+
+            if self._system == "Windows":
+                p = self._launch_windows_update_script(
+                    script_path, args_repr, needs_elevation
+                )
+            else:
+                p = self._launch_posix_update_script(
+                    script_path,
+                    args_repr,
+                    needs_elevation,
+                    update_source_path,
+                    log_path,
+                    install_dir,
+                )
+
+            logger.debug(f"External updater script launched with PID: {p.pid}")
+            logger.debug(f"Arguments used: {args_repr}")
+
+            # Give subprocess time to initialize before exit
+            time.sleep(1)
+
+            # Exit the application to allow update
+            sys.exit(0)
+
+        except Exception as e:
+            raise UpdateScriptLaunchError(f"Failed to launch update script: {e}") from e
+
+    def _launch_windows_update_script(
+        self,
+        script_path: Path,
+        args_repr: str | list[str],
+        needs_elevation: bool,
+    ) -> subprocess.Popen[Any]:
+        """
+        Launch the update script on Windows platform.
+
+        Args:
+            script_path: Path to the update script
+            args_repr: Arguments for the script
+            needs_elevation: Whether to run with elevated privileges
+
+        Returns:
+            The subprocess.Popen object for the launched script
+        """
+        cwd = str(AppInfo().application_folder)
+        if needs_elevation:
+            # Use PowerShell to run as administrator
+            p = subprocess.Popen(
+                args_repr,
+                shell=True,
+                cwd=cwd,
+            )
+        else:
+            # Convert list args to string command for proper window display and argument passing
+            if isinstance(args_repr, list):
+                # Build command string with proper quoting for Windows batch execution
+                # Always quote path arguments to handle spaces and special characters
+                cmd_parts = []
+                for i, arg in enumerate(args_repr):
+                    arg_str = str(arg)
+
+                    # First two items are 'cmd' and '/k' flags, don't quote them
+                    if i < 2:
+                        cmd_parts.append(arg_str)
+                    else:
+                        # Quote all remaining arguments (paths) to ensure proper handling
+                        # of spaces and special characters in usernames/paths
+                        cmd_parts.append(f'"{arg_str}"')
+                cmd_str = " ".join(cmd_parts)
+
+                # Need to enclose script and its args in quotes
+                # cmd /k ""update.bat" "temp_update_path" "log_path""
+                cmd_str = cmd_str.replace("/k ", '/k "', 1)
+                cmd_str = cmd_str + '"'
+            else:
+                cmd_str = args_repr
+
+            logger.debug(f"Launching update script with command: {cmd_str}")
+
+            # Use 'start' command to ensure visible console window
+            # Quote the working directory for paths with spaces
+            start_cmd = f'start "RimSort Update" /D "{cwd}" {cmd_str}'
+            logger.debug(f"Using start command: {start_cmd}")
+
+            p = subprocess.Popen(
+                start_cmd,
+                shell=True,
+                cwd=cwd,
+            )
+        return p
+
+    def _launch_posix_update_script(
+        self,
+        script_path: Path,
+        args_repr: str | list[str],
+        needs_elevation: bool,
+        update_source_path: Path,
+        log_path: Path,
+        install_dir: Path,
+    ) -> subprocess.Popen[Any]:
+        """
+        Launch the update script on POSIX systems (Linux/macOS).
+
+        For Linux: Uses hybrid approach:
+        1. Primary: Direct bash execution (works with all terminal emulators)
+        2. Fallback: Terminal emulator if direct execution fails
+
+        Args:
+            script_path: Path to the update script
+            args_repr: Arguments for the script
+            needs_elevation: Whether to run with elevated privileges
+            update_source_path: Path to the update source
+            log_path: Path to the log file
+            install_dir: Installation directory
+
+        Returns:
+            The subprocess.Popen object for the launched script
+        """
+        # Ensure script is executable
+        if script_path.exists() and not os.access(script_path, os.X_OK):
+            try:
+                os.chmod(script_path, 0o755)
+                logger.debug(f"Made script executable: {script_path}")
+            except OSError as e:
+                logger.warning(f"Could not make script executable: {e}")
+
+        # For systems requiring elevation, copy script to temp location to avoid permission issues
+        if needs_elevation:
+            fd, temp_script_path = tempfile.mkstemp(
+                suffix=".sh", prefix="rimsort_update_"
+            )
+            os.close(fd)
+            shutil.copy2(str(script_path), temp_script_path)
+            os.chmod(temp_script_path, 0o700)
+            logger.debug(f"Copied script to temp location: {temp_script_path}")
+            script_path = Path(temp_script_path)
+            # Rebuild args_repr with the new script path
+            config = self._script_configs[self._system]
+            args_repr = config.get_args(
+                script_path,
+                update_source_path,
+                log_path,
+                needs_elevation,
+                install_dir,
+                update_manager=self,
+            )
+
+        # Try primary method first (direct bash for Linux, osascript for macOS)
+        try:
+            if self._system == "Linux" and needs_elevation:
+                raise Exception("sudo requires a terminal emulator on Linux")  # noqa: TRY002
+
+            logger.debug(f"Attempting primary launch method on {self._system}")
+            p = subprocess.Popen(
+                args_repr,
+                shell=True,
+                cwd=str(AppInfo().application_folder),
+            )
+            logger.info(
+                f"Successfully launched update script with primary method (PID: {p.pid})"
+            )
+            return p
+        except Exception as e:
+            # Fallback for Linux only - try terminal emulator if direct bash fails
+            if self._system == "Linux":
+                logger.warning(
+                    f"Primary method failed on Linux ({e}), attempting terminal emulator fallback..."
+                )
+                try:
+                    terminal = self._detect_terminal_emulator()
+                    base_args = [
+                        str(script_path),
+                        str(update_source_path),
+                        str(log_path),
+                    ]
+                    if install_dir:
+                        base_args.append(str(install_dir))
+
+                    config = self._script_configs["Linux"]
+                    fallback_cmd = config._build_terminal_command(
+                        terminal, base_args, needs_elevation
+                    )
+                    logger.info(f"Using terminal emulator fallback: {terminal}")
+
+                    p = subprocess.Popen(
+                        fallback_cmd,
+                        shell=True,
+                        cwd=str(AppInfo().application_folder),
+                    )
+                    logger.info(
+                        f"Successfully launched update script with terminal fallback (PID: {p.pid})"
+                    )
+                    return p
+                except Exception as fallback_err:
+                    logger.error(
+                        f"Both primary and fallback methods failed: {e} -> {fallback_err}"
+                    )
+                    raise UpdateScriptLaunchError(
+                        f"Failed to launch update script. Primary method: {e}. Fallback: {fallback_err}"
+                    ) from fallback_err
+            else:
+                # For macOS, no fallback - just raise the error
+                logger.error(f"Failed to launch update script on {self._system}: {e}")
+                raise UpdateScriptLaunchError(
+                    f"Failed to launch update script on {self._system}: {e}"
+                ) from e
+
+    def _launch_msi_installer(
+        self, msi_path: Path, log_path: Path, needs_elevation: bool
+    ) -> None:
+        """
+        Launch the MSI installer on Windows.
+
+        The MSI is configured with CustomActions to automatically launch RimSort.exe
+        after installation completes. Windows handles UAC elevation if required.
+
+        Args:
+            msi_path: Path to the MSI file
+            log_path: Path to the installation log file
+            needs_elevation: Whether the app is installed in a protected location
+
+        Raises:
+            UpdateScriptLaunchError: If MSI launch fails
+        """
+        # Validate MSI file exists
+        if not msi_path.exists():
+            raise UpdateScriptLaunchError(f"MSI file not found: {msi_path}")
+
+        if not msi_path.is_file():
+            raise UpdateScriptLaunchError(f"MSI path is not a file: {msi_path}")
+
+        # Ensure log directory exists
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not create log directory: {e}")
+
+        # Build msiexec command
+        cmd = [
+            "msiexec",
+            "/i",
+            str(msi_path),
+            "/passive",
+            "/norestart",
+            "/log",
+            str(log_path),
+        ]
+
+        try:
+            logger.info(f"Launching MSI installer: {msi_path}")
+            subprocess.Popen(cmd)
+            self.update_progress.emit(100, "Update launched!")
+            logger.info("MSI launched, exiting RimSort to allow file replacement")
+
+            # Give subprocess time to initialize before exit
+            time.sleep(1)
+
+        except FileNotFoundError as e:
+            raise UpdateScriptLaunchError(f"msiexec executable not found: {e}") from e
+        except Exception as e:
+            raise UpdateScriptLaunchError(f"Failed to launch MSI: {e}") from e
+
+        # Exit immediately to allow MSI to replace files and process
+        sys.exit(0)
+
+    def _prepare_update_log(self, system: str) -> Path:
+        """
+        Prepare the update log file and write prologue.
+
+        Args:
+            system: The current platform system
+
+        Returns:
+            Path to the log file
+        """
+        log_dir = AppInfo().user_log_folder
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / UPDATER_LOG_FILENAME
+
+        # Small prologue in the updater log to aid debugging
+        try:
+            with open(log_path, "a", encoding="utf-8", errors="ignore") as lf:
+                lf.write(
+                    f"\n===== RimSort updater launched: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ({system}) =====\n"  # noqa: DTZ005
+                )
+        except Exception:  # noqa: S110
+            # Non-fatal; continue without preface
+            pass
+
+        return log_path
+
+    def _get_script_info(
+        self, update_source_path: Path, log_path: Path, needs_elevation: bool
+    ) -> tuple[Path, str | list[str], bool | None, Path]:
+        """
+        Get the script path, arguments representation, and session flag for the platform.
+
+        Args:
+            update_source_path: Path to the extracted update directory
+            log_path: Path to the log file
+            needs_elevation: Whether to run with elevated privileges
+
+        Returns:
+            Tuple of (script_path, args_repr, start_new_session, install_dir)
+        """
+        config = self._script_configs[self._system]
+        script_path = config.get_script_path()
+
+        # For AppImage, install_dir is the directory containing the .AppImage file
+        appimage_path = AppInfo().appimage_path
+        if appimage_path is not None:
+            install_dir = appimage_path.parent
+        elif self._system == "Darwin":
+            install_dir = script_path.parents[2]
+        else:
+            install_dir = script_path.parent
+        args_repr = config.get_args(
+            script_path,
+            update_source_path,
+            log_path,
+            needs_elevation,
+            install_dir,
+            update_manager=self,
+        )
+        start_new_session = config.start_new_session
+
+        return script_path, args_repr, start_new_session, install_dir
+
+    def _extract_update_with_progress(
+        self, is_msi: bool = False, is_tar_gz: bool = False
+    ) -> None:
+        """
+        Extract or prepare the update with a progress window.
+
+        For ZIP files, _extract_zip creates its own progress window with ZipExtractThread.
+        MSI preparation is instant (just writes bytes) so no UI needed.
+        Extraction runs on main thread to ensure Qt operations work correctly.
+
+        Args:
+            is_msi: Whether the update is an MSI installer
+            is_tar_gz: Whether the update is a tar.gz archive
+        """
+        # Run extraction on main thread (Qt operations require main thread)
+        self._extracted_path = self._extract_update_thread_worker(is_msi, is_tar_gz)
+
+    def _extract_update_thread_worker(
+        self, is_msi: bool = False, is_tar_gz: bool = False
+    ) -> Path:
+        """Worker thread for extraction."""
+        return self._extract_update(is_msi, is_tar_gz)
+
+    def _show_progress_widget(
+        self, progress_widget: TaskProgressWindow, cancellable: bool = True
+    ) -> None:
+        """Show progress widget in panel or as standalone window."""
+        progress_widget.set_cancel_enabled(cancellable)
+
+        if self.mod_info_panel:
+            self.mod_info_panel.info_panel_frame.hide()
+            if hasattr(self.main_content, "disable_enable_widgets_signal"):
+                self.main_content.disable_enable_widgets_signal.emit(False)
+            self.mod_info_panel.panel.addWidget(progress_widget)
+            progress_widget.show()
+        else:
+            progress_widget.show()
+
+    def _hide_progress_widget(self, progress_widget: TaskProgressWindow | None) -> None:
+        """Close and remove progress widget from panel."""
+        try:
+            if progress_widget:
+                progress_widget.close()
+                if self.mod_info_panel:
+                    self.mod_info_panel.panel.removeWidget(progress_widget)
+                    self.mod_info_panel.info_panel_frame.show()
+        except Exception:
+            logger.exception("Error cleaning up progress widget")
+
+    def _create_backup_with_progress(self) -> bool:
+        """Create a backup and return whether the update may proceed."""
+        self._progress_widget = TaskProgressWindow(
+            title=self.tr("Creating Backup"),
+            show_message=True,
+            show_percent=True,
+        )
+        self._progress_widget.set_message(
+            self.tr("Creating backup... (this may take several minutes)")
+        )
+        progress_widget = self._progress_widget
+
+        # Show progress widget (backup cannot be cancelled)
+        self._show_progress_widget(self._progress_widget, cancellable=False)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # noqa: DTZ005
+        extension = (
+            ".tar.gz"
+            if sys.platform == "darwin" and "__compiled__" in globals()
+            else ".zip"
+        )
+        backup_path = (
+            AppInfo().application_backups_folder
+            / f"RimSort_Backup_{timestamp}{extension}"
+        )
+        worker = _BackupWorker(AppInfo().application_folder, backup_path)
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timed_out = False
+        quitting = False
+
+        def timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            worker.requestInterruption()
+            progress_widget.set_message(
+                self.tr("Backup timed out. Waiting for the backup to stop...")
+            )
+
+        def shutdown() -> None:
+            nonlocal quitting
+            quitting = True
+            worker.requestInterruption()
+
+        worker.progress.connect(
+            self._on_backup_progress, Qt.ConnectionType.QueuedConnection
+        )
+        worker.finished.connect(loop.quit, Qt.ConnectionType.QueuedConnection)
+        timer.timeout.connect(timeout)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(shutdown)
+        try:
+            timer.start(int(BACKUP_TIMEOUT_SECONDS * 1000))
+            worker.start()
+            loop.exec()
+        finally:
+            timer.stop()
+            worker.requestInterruption()
+            worker.wait()
+            worker.progress.disconnect(self._on_backup_progress)
+            if app is not None:
+                app.aboutToQuit.disconnect(shutdown)
+            self._hide_progress_widget(self._progress_widget)
+            self._progress_widget = None
+
+        if quitting:
+            return False
+        if timed_out:
+            dialogue.show_warning(
+                title=self.tr(ERR_BACKUP_FAILED_TITLE),
+                text=self.tr("Backup timed out. The update was stopped."),
+            )
+            return False
+        if worker.error is not None:
+            answer = dialogue.show_dialogue_conditional(
+                title=self.tr(ERR_BACKUP_FAILED_TITLE),
+                text=self.tr(
+                    "Failed to create a backup before updating. Do you want to continue without a backup?"
+                ),
+                information=worker.error,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+
+        self._cleanup_old_backups()
+        return True
+
+    @Slot(int, int)
+    def _on_backup_progress(self, current: int, total: int) -> None:
+        if self._progress_widget is not None and total > 0:
+            self._progress_widget.update_progress(
+                int(current / total * 100),
+                self.tr("Backing up files: {current} / {total}").format(
+                    current=current, total=total
+                ),
+            )
+
+    def _cleanup_old_backups(self) -> None:
+        """
+        Clean up old backups, keeping only the most recent ones based on max_backups setting.
+        """
+        app_backup_folder = AppInfo().application_backups_folder
+        max_backups = self.settings.max_backups
+
+        try:
+            # Get all backup files
+            backup_files = [
+                *app_backup_folder.glob("RimSort_Backup_*.zip"),
+                *app_backup_folder.glob("RimSort_Backup_*.tar.gz"),
+            ]
+            if len(backup_files) <= max_backups:
+                logger.debug(
+                    f"Backup count ({len(backup_files)}) is within limit ({max_backups})"
+                )
+                return
+
+            # Sort by modification time (newest first)
+            backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            # Remove old backups
+            backups_to_remove = backup_files[max_backups:]
+            for backup_file in backups_to_remove:
+                try:
+                    backup_file.unlink()
+                    logger.info(f"Removed old backup: {backup_file.name}")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to remove old backup {backup_file.name}: {e}"
+                    )
+
+            logger.info(
+                f"Cleaned up {len(backups_to_remove)} old backups, keeping {max_backups} most recent"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old backups: {e}")
+
+    def show_update_error(self) -> None:
+        dialogue.show_warning(
+            title=self.tr(ERR_RETRIEVE_RELEASE_TITLE),
+            text=self.tr(ERR_RETRIEVE_RELEASE_TEXT),
+        )
