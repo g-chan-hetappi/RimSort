@@ -3,8 +3,8 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from PySide6.QtCore import QModelIndex, QPointF, QSize, Qt
-from PySide6.QtGui import QColor, QDropEvent
+from PySide6.QtCore import QEvent, QModelIndex, QPointF, QSize, Qt
+from PySide6.QtGui import QColor, QDropEvent, QEnterEvent
 from PySide6.QtWidgets import QListWidget, QListWidgetItem
 
 from app.models.metadata.metadata_structure import (
@@ -626,6 +626,25 @@ def test_background_color_picks_readable_text_color(
     style = widget.styleSheet()
     assert f"background: {background};" in style
     assert f"color: {expected_text};" in style
+
+
+def test_hover_draws_border_and_keeps_custom_background(qtbot: Any) -> None:
+    widget = _make_item_inner(qtbot, soft_warning=False)
+    widget.settings.color_background_instead_of_text_toggle = True
+    widget.mod_color = QColor("#ffff00")
+    widget.handle_mod_color_change(init=True)
+    style_before = widget.styleSheet()
+    assert style_before
+
+    widget.enterEvent(QEnterEvent(QPointF(1, 1), QPointF(1, 1), QPointF(1, 1)))
+
+    assert widget._hover_border.isVisibleTo(widget)
+    assert widget.styleSheet() == style_before
+
+    widget.leaveEvent(QEvent(QEvent.Type.Leave))
+
+    assert not widget._hover_border.isVisibleTo(widget)
+    assert widget.styleSheet() == style_before
 
 
 def test_soft_warning_not_applied_when_load_order_warning_present(qtbot: Any) -> None:

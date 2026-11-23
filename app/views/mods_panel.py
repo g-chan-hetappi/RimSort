@@ -38,6 +38,9 @@ from PySide6.QtGui import (
     QImage,
     QKeyEvent,
     QKeySequence,
+    QPainter,
+    QPaintEvent,
+    QPen,
     QPixmap,
     QResizeEvent,
 )
@@ -126,6 +129,45 @@ from app.views.divider_widget import DividerItemInner
 from app.views.filter_panel import FilterButton
 
 
+class HoverBorderOverlay(QWidget):
+    """
+    Transparent overlay that draws a solid border around its parent.
+
+    Used to show which mod list item is hovered without changing the item's
+    background (so custom mod background colors stay visible). It lives on top of
+    the item's child widgets, ignores the mouse, and does not affect the layout.
+    """
+
+    BORDER_WIDTH = 3
+    BORDER_COLOR = QColor("yellow")
+    # Thin line just inside the border so it stays visible on yellow backgrounds
+    INNER_LINE_COLOR = QColor("black")
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.hide()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        """
+        Draw the border just inside the widget edges.
+
+        :param event: the paint event
+        """
+        painter = QPainter(self)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        rect = QRectF(self.rect())
+        for color, width, inset in (
+            (self.BORDER_COLOR, self.BORDER_WIDTH, self.BORDER_WIDTH / 2),
+            (self.INNER_LINE_COLOR, 1, self.BORDER_WIDTH + 0.5),
+        ):
+            pen = QPen(color, width)
+            pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+            painter.setPen(pen)
+            painter.drawRect(rect.adjusted(inset, inset, -inset, -inset))
+
+
 class ModListItemInner(QWidget):
     """
     Subclass for QWidget. Used to store data for a single
@@ -176,6 +218,8 @@ class ModListItemInner(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
         self._selected = False
         self._hovered = False
+        # Border drawn on top of the item while the cursor hovers over it
+        self._hover_border = HoverBorderOverlay(self)
 
         # Cache MetadataController instance
         self.metadata_controller = metadata_controller or MetadataController.instance()
@@ -449,13 +493,16 @@ class ModListItemInner(QWidget):
 
     def enterEvent(self, event: QEnterEvent) -> None:
         self._hovered = True
-        if self._selected:
-            return
-        self.setStyleSheet("")
+        # Show hover as a border instead of replacing the background, so a custom
+        # mod color stays visible while hovering.
+        self._hover_border.setGeometry(self.rect())
+        self._hover_border.raise_()
+        self._hover_border.show()
         super().enterEvent(event)
 
     def leaveEvent(self, event: QEvent) -> None:
         self._hovered = False
+        self._hover_border.hide()
         if self._selected:
             return
         if self.mod_color is None:
@@ -588,6 +635,7 @@ class ModListItemInner(QWidget):
         :param event: the resize event
         :param icon_count: int, the number of icons to consider for width calculation. If -1, icon count will be calculated
         """
+        self._hover_border.setGeometry(self.rect())
         if icon_count == -1:
             # Count the number of QLabel widgets with QIcon and calculate total icon width
             icon_count = self.count_icons(self)

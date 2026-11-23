@@ -137,9 +137,6 @@ QListWidget::item:selected:!active {
 QListWidget::item:selected:active {
     background: #6a5a5a;
 }
-QListWidget::item:hover {
-    background: #4a3a3a;
-}
 /* Default context menu style */
 QMenu {
     background-color: #3b2f2f;
