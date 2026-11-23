@@ -5732,7 +5732,7 @@ Please choose one of the following options to proceed.</source>
     </message>
     <message>
         <source>OK</source>
-        <translation>わかりました</translation>
+        <translation>OK</translation>
     </message>
     <message>
         <source>Cancel</source>
