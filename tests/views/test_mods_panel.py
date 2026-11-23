@@ -141,6 +141,33 @@ class TestTagEditDialog:
         assert item.isHidden() is False
         # jscpd:ignore-end
 
+    def test_typed_tag_is_committed_on_accept(self, dialog: TagEditDialog) -> None:
+        """
+        A new tag typed but not confirmed with Enter/comma is kept when OK is clicked.
+
+        :param dialog: The TagEditDialog instance to test.
+        """
+        dialog.tags_text_input.setText("newtag")
+
+        dialog.ok_button.click()
+
+        assert "newtag" in dialog.selected_tags()
+        assert dialog.tags_text_input.text() == ""
+
+    def test_typed_existing_selected_tag_stays_selected_on_accept(
+        self, dialog: TagEditDialog
+    ) -> None:
+        """
+        Typing an already-selected tag and clicking OK must not deselect it.
+
+        :param dialog: The TagEditDialog instance to test.
+        """
+        dialog.tags_text_input.setText("a")
+
+        dialog.ok_button.click()
+
+        assert "a" in dialog.selected_tags()
+
     def test_update_existing_tag_already_selected(self, dialog: TagEditDialog) -> None:
         """
         Test updating an existing tag that is already selected.

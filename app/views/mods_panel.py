@@ -979,13 +979,27 @@ class TagEditDialog(QDialog):
         """
         tag_item.setSelected(not tag_item.isSelected())
 
-    def upsert_typed_tag(self) -> None:
+    def accept(self) -> None:
+        """
+        Accept the dialog, first committing any text still typed in the input field.
+
+        Without this, a new tag that was typed but not confirmed with Enter or a
+        comma would be silently dropped when the user clicks OK.
+        """
+        self.upsert_typed_tag(toggle_existing=False)
+        super().accept()
+
+    def upsert_typed_tag(self, toggle_existing: bool = True) -> None:
         """
         Upsert the current tag in the tag input (triggered by the Enter key or typing comma).
 
         If the typed tag exactly matches an existing tag, it is selected.
         Otherwise, a new pre-selected tag item is added to the list.
         The input field is then cleared so the user can type the next tag.
+
+        :param toggle_existing: Toggle the selection of an existing matching tag
+            (interactive Enter/comma). When False, an existing matching tag is
+            always left selected (used when committing on OK).
         """
         for tag in self.tags_text_input.text().split(","):
             tag = tag.strip().lower()
@@ -997,7 +1011,10 @@ class TagEditDialog(QDialog):
                 assert len(matched_items) == 1, (
                     "Expected exactly one matched item matching exactly the typed tag"
                 )
-                self.toggle_tag_item_selection(matched_items[0])
+                if toggle_existing:
+                    self.toggle_tag_item_selection(matched_items[0])
+                else:
+                    matched_items[0].setSelected(True)
             else:
                 item_new = QListWidgetItem(tag)
                 self.tags_list.addItem(item_new)
